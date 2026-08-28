@@ -37,6 +37,16 @@ def get_state_dir() -> Path:
     return path
 
 
+def sanitize_title(title: str | None) -> str:
+    if not title or not isinstance(title, str):
+        return ""
+    # Strip ANSI escape sequences (CSI / OSC / etc.)
+    title = re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", title)
+    # Strip non-printable and control characters (0x00-0x1F, 0x7F-0x9F, including BEL \x07)
+    title = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", title)
+    return title.strip()
+
+
 def herdr_rpc(method: str, params: dict | None = None, timeout: float = 1.5) -> dict | None:
     socket_path = get_socket_path()
     if not os.path.exists(socket_path):
@@ -47,19 +57,18 @@ def herdr_rpc(method: str, params: dict | None = None, timeout: float = 1.5) -> 
         "params": params or {},
     }
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(socket_path)
-        s.sendall((json.dumps(req) + "\n").encode())
-        res = b""
-        while b"\n" not in res:
-            chunk = s.recv(16384)
-            if not chunk:
-                break
-            res += chunk
-        s.close()
-        if res:
-            return json.loads(res.decode().strip())
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(socket_path)
+            s.sendall((json.dumps(req) + "\n").encode())
+            res = b""
+            while b"\n" not in res:
+                chunk = s.recv(16384)
+                if not chunk:
+                    break
+                res += chunk
+            if res:
+                return json.loads(res.decode().strip())
     except Exception:
         pass
     return None
@@ -93,10 +102,10 @@ class StateManager:
 
     def save(self):
         try:
-            tmp = self.file_path.with_suffix(".tmp")
+            tmp = self.file_path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
-            tmp.rename(self.file_path)
+            tmp.replace(self.file_path)
         except Exception:
             pass
 
@@ -122,6 +131,9 @@ def clean_task_title(text: str) -> str | None:
         "Base directory for this skill:" in text
         or "Caveat: The messages below" in text
         or text.startswith("<system-reminder>")
+        or text.startswith("<task-notification>")
+        or text.startswith("<local-command-")
+        or text.startswith("<user-prompt-submit")
         or text.startswith("Ran ")
         or text.startswith("Task #")
         or text.startswith("UserPromptSubmit")
@@ -132,29 +144,35 @@ def clean_task_title(text: str) -> str | None:
     # XML command extraction: e.g. <command-message>chat-catchup</command-message><command-name>/chat-catchup</command-name><command-args>...</command-args>
     if "<command-name>" in text or "<command-message>" in text:
         cmd_name_match = re.search(r"<command-name>(.*?)</command-name>", text, re.DOTALL)
+        cmd_msg_match = re.search(r"<command-message>(.*?)</command-message>", text, re.DOTALL)
         cmd_args_match = re.search(r"<command-args>(.*?)</command-args>", text, re.DOTALL)
-        cmd = cmd_name_match.group(1).strip().lstrip("/") if cmd_name_match else ""
+
+        cmd = ""
+        if cmd_name_match:
+            cmd = cmd_name_match.group(1).strip().lstrip("/")
+        elif cmd_msg_match:
+            cmd = cmd_msg_match.group(1).strip().lstrip("/")
+
         args = cmd_args_match.group(1).strip() if cmd_args_match else ""
 
         if cmd in {"clear", "compact", "cost", "help", "fast", "exit", "quit", "rename"}:
             if cmd == "rename" and args:
-                return args[:32]
+                return sanitize_title(args)[:32]
             return None
 
         if args and len(args) > 1:
             first_arg_line = args.split("\n")[0].strip()
-            return f"{cmd} {first_arg_line}"[:32].strip()
+            return sanitize_title(f"{cmd} {first_arg_line}")[:32].strip()
         elif cmd:
-            return cmd[:32]
-        return None
-
-    if text.startswith("<"):
+            return sanitize_title(cmd)[:32]
         return None
 
     # Grok/Claude handoff extraction: e.g. 【从 Grok 接管任务：OOS-词性缓存】
-    grok_match = re.search(r"接管任务[：:]\s*([^\s】\n]+)", text)
+    grok_match = re.search(r"接管任务[：:]\s*([^】\n]+)", text)
     if grok_match:
-        return grok_match.group(1).strip()
+        val = sanitize_title(grok_match.group(1).strip())[:32]
+        if val:
+            return val
 
     # Filter out generic short acknowledgements
     lower = text.lower()
@@ -164,21 +182,30 @@ def clean_task_title(text: str) -> str | None:
     # If slash command, extract parameter
     if text.startswith("/"):
         parts = text.split(maxsplit=1)
-        if len(parts) > 1 and len(parts[1].strip()) > 2:
-            text = parts[1].strip()
+        cmd = parts[0].lstrip("/")
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd in {"clear", "compact", "cost", "help", "fast", "exit", "quit", "rename"}:
+            if cmd == "rename" and args:
+                return sanitize_title(args)[:32]
+            return None
+
+        if args and len(args) > 2:
+            text = args
         else:
-            cmd = parts[0].lstrip("/")
-            if cmd in {"clear", "compact", "cost", "help", "fast", "exit", "quit"}:
-                return None
             text = cmd
 
     # Take first line
     first_line = text.split("\n")[0].strip()
-    # Strip markdown headers, bullet lists, numbers, quotes
-    first_line = re.sub(r"^[\s\d\.\-\*\#\>\[\]\(\)\|\:\：]+", "", first_line).strip()
+    # Strip markdown headers, blockquotes, bullets, and task checkboxes
+    first_line = re.sub(r"^[\s\#\>\*\-\|]+", "", first_line).strip()
+    first_line = re.sub(r"^\[[ xX]\]\s*", "", first_line).strip()
+    # Strip leading numbered list prefixes: 1. / 1) / (1) / [1]
+    first_line = re.sub(r"^(?:\d+[\.\:\：\)\/]|[\(\[]\d+[\)\]])\s*", "", first_line).strip()
     # Strip trailing punctuation
     first_line = re.sub(r"[\s\.\,\!\?\,\。\!\？]+$", "", first_line).strip()
 
+    first_line = sanitize_title(first_line)
     if not first_line or len(first_line) < 2:
         return None
 
@@ -246,13 +273,16 @@ def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str 
                 pass
 
             if last_custom_title:
-                return last_custom_title[:32]
+                return sanitize_title(last_custom_title)[:32]
             if first_prompt_title:
-                return first_prompt_title[:32]
+                return sanitize_title(first_prompt_title)[:32]
 
-    # 3. If session_id is missing or stale, try resolving from terminal_title
+    # 3. If session_id is missing or stale, try resolving from terminal_title across recent transcripts
     if terminal_title and terminal_title not in {"claude", "zsh", "bash", "sh", "None"}:
-        for p in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        candidate_files = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+        # Sort by mtime, cap to top 5 recent files to prevent disk scan latency
+        candidate_files.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+        for p in candidate_files[:5]:
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     for line in f:
@@ -267,8 +297,9 @@ def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str 
                                         with open(ct_matches[0], "r", encoding="utf-8") as h:
                                             ct_data = json.load(h)
                                             if ct_data.get("customTitle"):
-                                                return str(ct_data["customTitle"]).strip()[:32]
-                                return (d.get("customTitle") or d.get("agentName"))[:32]
+                                                return sanitize_title(str(ct_data["customTitle"]))[:32]
+                                res = d.get("customTitle") or d.get("agentName")
+                                return sanitize_title(res)[:32]
             except Exception:
                 pass
 
@@ -276,7 +307,7 @@ def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str 
     if cwd:
         base = os.path.basename(os.path.abspath(cwd))
         if base and base not in {"bytedance", "staff", "Desktop", "root", "~", "now"}:
-            return base[:32]
+            return sanitize_title(base)[:32]
 
     return None
 
@@ -299,7 +330,9 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
             with open(statusline_mapping, "r", encoding="utf-8") as smf:
                 sdata = json.load(smf)
                 live_sid = sdata.get("session_id")
-                if live_sid:
+                # TTL check: ignore mappings older than 2 hours
+                mapping_ts = sdata.get("ts", 0)
+                if live_sid and (time.time() - mapping_ts < 7200):
                     session_id = live_sid
         except Exception:
             pass
@@ -316,6 +349,7 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     if not target_title:
         return False
 
+    target_title = sanitize_title(target_title)
     updated = False
 
     # 1. Sync Pane Label (for Mac 4-column border)
@@ -324,17 +358,29 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         if res and "result" in res:
             updated = True
 
-    # 2. Sync Herdr Metadata (report title, keep display_agent clean)
-    herdr_rpc("pane.report_metadata", {
-        "pane_id": pane_id,
-        "source": "herdr:claude",
-        "title": target_title,
-        "display_agent": target_title
-    })
+    # 2. Sync Herdr Metadata (report title, preserve display_agent persona)
+    if current_label != target_title or terminal_title != target_title:
+        herdr_rpc("pane.report_metadata", {
+            "pane_id": pane_id,
+            "source": "herdr:claude",
+            "title": target_title
+        })
 
     # 3. Directly update PTY xterm terminal_title via pane slave TTY (for Heeler card line 2)
-    pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
-    shell_pid = pinfo.get("result", {}).get("process_info", {}).get("shell_pid") if pinfo else None
+    if terminal_title != target_title:
+        pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
+        shell_pid = pinfo.get("result", {}).get("process_info", {}).get("shell_pid") if pinfo else None
+        tty_path = get_tty_for_pid(shell_pid)
+        if tty_path and os.path.exists(tty_path):
+            try:
+                with open(tty_path, "w") as tty_file:
+                    tty_file.write(f"\033]0;{target_title}\007")
+                    tty_file.flush()
+                updated = True
+            except Exception:
+                pass
+
+    return updated
     tty_path = get_tty_for_pid(shell_pid)
     if tty_path and os.path.exists(tty_path):
         try:
