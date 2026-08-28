@@ -23,7 +23,12 @@ class TestSyncTitle(unittest.TestCase):
     def test_filter_system_and_greetings(self):
         self.assertIsNone(clean_task_title("好的"))
         self.assertIsNone(clean_task_title("<system-reminder>test</system-reminder>"))
+        self.assertIsNone(clean_task_title("Base directory for this skill: /Users/bytedance/.claude/skills/chat-catchup"))
         self.assertIsNone(clean_task_title("ok"))
+
+    def test_clean_xml_command(self):
+        text = "<command-message>chat-catchup</command-message>\n<command-name>/chat-catchup</command-name>\n<command-args>oc_0553988837b02670ab7e68a1caea83ea</command-args>"
+        self.assertEqual(clean_task_title(text), "chat-catchup oc_0553988837b02670")
 
 
 if __name__ == "__main__":

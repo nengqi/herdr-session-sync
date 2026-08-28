@@ -117,8 +117,38 @@ def clean_task_title(text: str) -> str | None:
     if not text:
         return None
 
-    # Filter out internal system instructions / tags
-    if text.startswith("<") or text.startswith("Ran ") or text.startswith("Task #") or text.startswith("UserPromptSubmit"):
+    # Filter out internal system instructions / skill headers / reminders
+    if (
+        "Base directory for this skill:" in text
+        or "Caveat: The messages below" in text
+        or text.startswith("<system-reminder>")
+        or text.startswith("Ran ")
+        or text.startswith("Task #")
+        or text.startswith("UserPromptSubmit")
+        or text.startswith("Session renamed to:")
+    ):
+        return None
+
+    # XML command extraction: e.g. <command-message>chat-catchup</command-message><command-name>/chat-catchup</command-name><command-args>...</command-args>
+    if "<command-name>" in text or "<command-message>" in text:
+        cmd_name_match = re.search(r"<command-name>(.*?)</command-name>", text, re.DOTALL)
+        cmd_args_match = re.search(r"<command-args>(.*?)</command-args>", text, re.DOTALL)
+        cmd = cmd_name_match.group(1).strip().lstrip("/") if cmd_name_match else ""
+        args = cmd_args_match.group(1).strip() if cmd_args_match else ""
+
+        if cmd in {"clear", "compact", "cost", "help", "fast", "exit", "quit", "rename"}:
+            if cmd == "rename" and args:
+                return args[:32]
+            return None
+
+        if args and len(args) > 1:
+            first_arg_line = args.split("\n")[0].strip()
+            return f"{cmd} {first_arg_line}"[:32].strip()
+        elif cmd:
+            return cmd[:32]
+        return None
+
+    if text.startswith("<"):
         return None
 
     # Grok/Claude handoff extraction: e.g. 【从 Grok 接管任务：OOS-词性缓存】
@@ -128,7 +158,7 @@ def clean_task_title(text: str) -> str | None:
 
     # Filter out generic short acknowledgements
     lower = text.lower()
-    if lower in {"ok", "yes", "no", "好的", "继续", "收到", "确认", "对", "行", "差不多", "测试"}:
+    if lower in {"ok", "yes", "no", "好的", "继续", "收到", "确认", "对", "行", "差不多", "测试", "align"}:
         return None
 
     # If slash command, extract parameter
@@ -178,7 +208,13 @@ def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
                             last_custom_title = str(d["agentName"]).strip()
 
                         # First real user prompt as fallback
-                        if not first_prompt_title and d.get("type") == "user" and d.get("message", {}).get("role") == "user":
+                        if (
+                            not first_prompt_title
+                            and d.get("type") == "user"
+                            and not d.get("isMeta")
+                            and not d.get("turnCompanion")
+                            and d.get("message", {}).get("role") == "user"
+                        ):
                             content = d.get("message", {}).get("content")
                             raw_text = ""
                             if isinstance(content, str):
@@ -187,7 +223,7 @@ def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
                                 for item in content:
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         t = item.get("text", "")
-                                        if not t.startswith("<"):
+                                        if not t.startswith("<system-reminder>") and "Base directory for this skill:" not in t:
                                             raw_text = t
                                             break
                             title = clean_task_title(raw_text)
