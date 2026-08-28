@@ -1,0 +1,38 @@
+id = "session-sync"
+name = "Session Sync"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Auto-sync Claude Code, Codex, and Agent session names across Herdr pane labels, PTY window titles, and mobile companion apps (Heeler)"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "sync-all"
+title = "Session Sync: all panes"
+description = "Scan all Herdr panes and sync session names, pane labels, and terminal titles"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["python3", "src/sync.py", "--all"]
+
+[[actions]]
+id = "sync-now"
+title = "Session Sync: current pane"
+description = "Sync the current pane title immediately"
+contexts = ["pane"]
+command = ["python3", "src/sync.py", "--pane-current"]
+
+[[actions]]
+id = "status"
+title = "Session Sync: status"
+description = "Print current session mapping and locks"
+contexts = ["global", "workspace"]
+command = ["python3", "src/sync.py", "--status"]
+
+[[events]]
+on = "pane.created"
+command = ["python3", "src/sync.py", "--event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "src/sync.py", "--event"]
+
+[[startup]]
+command = ["python3", "src/sync.py", "--all"]
