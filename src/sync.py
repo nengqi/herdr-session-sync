@@ -185,64 +185,94 @@ def clean_task_title(text: str) -> str | None:
     return first_line[:32].strip()
 
 
-def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
-    if not session_id:
-        return None
+def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str = "") -> str | None:
+    # 1. Authoritative check: ~/.claude/projects/*/{session_id}/custom-title.json
+    if session_id:
+        ct_pattern = os.path.expanduser(f"~/.claude/projects/*/{session_id}/custom-title.json")
+        ct_matches = glob.glob(ct_pattern)
+        if ct_matches:
+            try:
+                with open(ct_matches[0], "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    if d.get("customTitle"):
+                        return str(d["customTitle"]).strip()[:32]
+            except Exception:
+                pass
 
-    pattern = os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl")
-    matches = glob.glob(pattern)
-    if matches:
-        transcript_path = matches[0]
-        last_custom_title = None
-        first_prompt_title = None
+        # 2. Check transcript JSONL for customTitle / agentName / first prompt
+        pattern = os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl")
+        matches = glob.glob(pattern)
+        if matches:
+            transcript_path = matches[0]
+            last_custom_title = None
+            first_prompt_title = None
 
-        try:
-            with open(transcript_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        d = json.loads(line)
-                        # Exact customTitle or agentName set in Claude Code
-                        if d.get("customTitle"):
-                            last_custom_title = str(d["customTitle"]).strip()
-                        elif d.get("agentName"):
-                            last_custom_title = str(d["agentName"]).strip()
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            d = json.loads(line)
+                            # Exact customTitle or agentName set in Claude Code
+                            if d.get("customTitle"):
+                                last_custom_title = str(d["customTitle"]).strip()
+                            elif d.get("agentName"):
+                                last_custom_title = str(d["agentName"]).strip()
 
-                        # First real user prompt as fallback
-                        if (
-                            not first_prompt_title
-                            and d.get("type") == "user"
-                            and not d.get("isMeta")
-                            and not d.get("turnCompanion")
-                            and d.get("message", {}).get("role") == "user"
-                        ):
-                            content = d.get("message", {}).get("content")
-                            raw_text = ""
-                            if isinstance(content, str):
-                                raw_text = content
-                            elif isinstance(content, list) and content:
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        t = item.get("text", "")
-                                        if not t.startswith("<system-reminder>") and "Base directory for this skill:" not in t:
-                                            raw_text = t
-                                            break
-                            title = clean_task_title(raw_text)
-                            if title:
-                                first_prompt_title = title
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                            # First real user prompt as fallback
+                            if (
+                                not first_prompt_title
+                                and d.get("type") == "user"
+                                and not d.get("isMeta")
+                                and not d.get("turnCompanion")
+                                and d.get("message", {}).get("role") == "user"
+                            ):
+                                content = d.get("message", {}).get("content")
+                                raw_text = ""
+                                if isinstance(content, str):
+                                    raw_text = content
+                                elif isinstance(content, list) and content:
+                                    for item in content:
+                                        if isinstance(item, dict) and item.get("type") == "text":
+                                            t = item.get("text", "")
+                                            if not t.startswith("<system-reminder>") and "Base directory for this skill:" not in t:
+                                                raw_text = t
+                                                break
+                                title = clean_task_title(raw_text)
+                                if title:
+                                    first_prompt_title = title
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-        # 1. Top priority: exact Claude Code session name (customTitle / agentName)
-        if last_custom_title:
-            return last_custom_title[:32]
+            if last_custom_title:
+                return last_custom_title[:32]
+            if first_prompt_title:
+                return first_prompt_title[:32]
 
-        # 2. Second priority: first user prompt title
-        if first_prompt_title:
-            return first_prompt_title[:32]
+    # 3. If session_id is missing or stale, try resolving from terminal_title
+    if terminal_title and terminal_title not in {"claude", "zsh", "bash", "sh", "None"}:
+        for p in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if terminal_title in line:
+                            d = json.loads(line)
+                            if d.get("agentName") == terminal_title or d.get("customTitle") == terminal_title:
+                                sid = d.get("sessionId")
+                                if sid:
+                                    ct_file = os.path.expanduser(f"~/.claude/projects/*/{sid}/custom-title.json")
+                                    ct_matches = glob.glob(ct_file)
+                                    if ct_matches:
+                                        with open(ct_matches[0], "r", encoding="utf-8") as h:
+                                            ct_data = json.load(h)
+                                            if ct_data.get("customTitle"):
+                                                return str(ct_data["customTitle"]).strip()[:32]
+                                return (d.get("customTitle") or d.get("agentName"))[:32]
+            except Exception:
+                pass
 
-    # 3. Fallback to Git repository / Directory basename
+    # 4. Fallback to Git repository / Directory basename
     if cwd:
         base = os.path.basename(os.path.abspath(cwd))
         if base and base not in {"bytedance", "staff", "Desktop", "root", "~", "now"}:
@@ -257,17 +287,14 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         return False
 
     current_label = pane.get("label")
-    cwd = pane.get("cwd", "")
+    cwd = pane.get("foreground_cwd") or pane.get("cwd", "")
     agent_session = pane.get("agent_session") or {}
     session_id = agent_session.get("value")
+    terminal_title = pane.get("terminal_title") or pane.get("title") or ""
 
-    target_title = None
-
-    if session_id:
-        # Read exact CC session name from transcript
-        target_title = extract_cc_session_name(session_id, cwd)
-        if target_title:
-            state.set_assigned_title(session_id, target_title)
+    target_title = extract_cc_session_name(session_id, cwd, terminal_title)
+    if target_title and session_id:
+        state.set_assigned_title(session_id, target_title)
 
     if not target_title and cwd:
         base = os.path.basename(os.path.abspath(cwd))
