@@ -292,6 +292,18 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     session_id = agent_session.get("value")
     terminal_title = pane.get("terminal_title") or pane.get("title") or ""
 
+    # Check live active mapping reported by Claude Code statusline
+    statusline_mapping = Path(f"/tmp/.herdr-pane-sessions/{pane_id}.json")
+    if statusline_mapping.exists():
+        try:
+            with open(statusline_mapping, "r", encoding="utf-8") as smf:
+                sdata = json.load(smf)
+                live_sid = sdata.get("session_id")
+                if live_sid:
+                    session_id = live_sid
+        except Exception:
+            pass
+
     target_title = extract_cc_session_name(session_id, cwd, terminal_title)
     if target_title and session_id:
         state.set_assigned_title(session_id, target_title)
