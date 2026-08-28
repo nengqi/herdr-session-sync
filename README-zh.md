@@ -28,7 +28,7 @@
 
 ---
 
-## 核心架构
+## 核心架构与特性
 
 ```text
        Herdr 运行时事件触发（pane.agent_status_changed / pane.created）
@@ -38,18 +38,27 @@
                                  │
          ┌───────────────────────┴────────────────────────┐
          ▼                                                ▼
- 1. 手动锁保护机制                                 2. 智能提取 Session 名字
- 已经手动命名的窗格保持原样，绝不覆盖               ├─ 最高优先：Claude Code 真实 customTitle
-                                                  ├─ 次优先：首轮真实任务意图（过滤杂质）
-                                                  └─ 兜底：当前 Git 仓库/业务目录名
+ 1. 实时 Session 管道映射                          2. 多层级智能提取 Session 名字
+ 实时接入 Claude Code 状态栏与 Hook 管道          ├─ 最高优先：权威 custom-title.json（/rename 秒级生效）
+                                                  ├─ 次优先：转录本 customTitle / agentName
+                                                  ├─ 智能解析：首轮真实意图与 Slash Command / Grok
+                                                  └─ 兜底：当前 Git 仓库与业务目录名
                                  │
                                  ▼
                     【三端统一写入通道】
       ┌──────────────────────────┼──────────────────────────┐
       ▼                          ▼                          ▼
  [Herdr 窗格顶部边框]        [底层 PTY 窗口标题]        [手机 Heeler 卡片]
- (herdr pane.rename)       (OSC 0;Title\007)       (副标题清晰显示任务名)
+ (herdr pane.rename)       (安全 OSC 0;Title\007)      (副标题清晰显示任务名)
 ```
+
+### 核心亮点
+
+* 🎯 **`/rename` 秒级实时对齐**：直读 Claude Code 权威 `custom-title.json`，在任意窗格敲 `/rename` 毫秒级同步至所有终端与手机端。
+* 🛡️ **PTY 终端防注入安全**：向 Slave PTY 写入转义序列前严格清洗 ANSI Escape 码与 C0/C1 控制字符，杜绝终端光标反射与字符污染。
+* 🧠 **Skill 与 Multi-Agent 结构化解析**：自动解析 `<command-name>`/`<command-args>`（如 `/chat-catchup`）与 Grok 接管头（`【从 Grok 接管任务：...】`），彻底过滤内部 Harness 元数据噪声。
+* ⚡ **高性能零全盘扫描**：全内存/有限文件范围检索，杜绝多窗格并发时的阻塞式磁盘全量扫描。
+* 📱 **完美适配 iOS Heeler 伴侣**：配合 iPhone/iPad 端的 [Heeler](https://testflight.apple.com/join/aXSxRn4r) 原生卡片呈现精准的任务副标题。
 
 ---
 

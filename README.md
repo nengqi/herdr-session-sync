@@ -28,7 +28,7 @@ When running multi-agent workflows in [Herdr](https://herdr.dev) (e.g. 4-column 
 
 ---
 
-## Architecture
+## Architecture & Features
 
 ```text
        Herdr Lifecycle Events (pane.agent_status_changed / pane.created)
@@ -38,9 +38,10 @@ When running multi-agent workflows in [Herdr](https://herdr.dev) (e.g. 4-column 
                                  │
          ┌───────────────────────┴────────────────────────┐
          ▼                                                ▼
- 1. Manual Lock Protection                         2. Smart Name Extraction
- Preserves user-assigned names                    ├─ Top: Real CC customTitle / agentName
-                                                  ├─ Fallback: Cleaned first-turn task intent
+ 1. Real-time Session Mapping                      2. Multi-tier Smart Extraction
+ Sourced from live Claude statusline & hooks      ├─ Top: Authoritative custom-title.json (/rename)
+                                                  ├─ Fast: Transcript customTitle / agentName
+                                                  ├─ Smart: Cleaned first-turn intent & Slash Commands
                                                   └─ Fallback: Active Git workspace/repo
                                  │
                                  ▼
@@ -48,8 +49,16 @@ When running multi-agent workflows in [Herdr](https://herdr.dev) (e.g. 4-column 
       ┌──────────────────────────┼──────────────────────────┐
       ▼                          ▼                          ▼
  [Herdr Pane Border]        [PTY Window Title]         [Heeler iOS Card]
- (herdr pane.rename)       (OSC 0;Title\007)       (Clear task subtitle)
+ (herdr pane.rename)       (Safe OSC 0;Title\007)      (Clean task subtitle)
 ```
+
+### Key Highlights
+
+* 🎯 **Instant `/rename` Synchronization**: Authoritative `custom-title.json` inspection detects `/rename` commands instantly across panes.
+* 🛡️ **PTY Escape Injection Protection**: Sanitizes all non-printable C0/C1 control characters and ANSI escape codes before writing to slave TTYs.
+* 🧠 **Skill & Multi-agent Parsing**: Intelligently cleans XML command tags (`<command-name>`, `<command-args>`), Grok handoff headers (`【从 Grok 接管任务：...】`), and filters out internal harness metadata.
+* ⚡ **Bounded Fast Lookups**: High-performance metadata caching with zero unbounded disk scans or polling loops.
+* 📱 **Heeler iOS Companion Ready**: Works out-of-the-box with [Heeler](https://testflight.apple.com/join/aXSxRn4r) on iPhone/iPad over direct SSH.
 
 ---
 
