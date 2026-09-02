@@ -1,6 +1,6 @@
 id = "session-sync"
 name = "Session Sync"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.7.5"
 description = "Auto-sync Claude Code, Codex, and Agent session names across Herdr pane labels, PTY window titles, and mobile companion apps (Heeler)"
 platforms = ["linux", "macos"]

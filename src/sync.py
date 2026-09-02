@@ -3,7 +3,7 @@
 
 Automatically syncs Claude Code / Agent session names to:
 1. Herdr Pane Labels (Mac 4-column border display)
-2. Terminal Title (PTY xterm title for Heeler iOS companion app card second-line)
+2. Herdr Pane Metadata & Window Titles (for Heeler iOS companion app cards)
 3. Herdr Tab Labels (Context-aware tab titles)
 
 Zero dependencies (Python standard library only).
@@ -44,6 +44,8 @@ def sanitize_title(title: str | None) -> str:
     title = re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", title)
     # Strip non-printable and control characters (0x00-0x1F, 0x7F-0x9F, including BEL \x07)
     title = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", title)
+    # Strip trailing punctuation, separators, and dashes (e.g. "相关性 MCP - " -> "相关性 MCP")
+    title = re.sub(r"[\s\.\,\!\?\,\。\!\？\:\：\|\-\—\–\_]+$", "", title)
     return title.strip()
 
 
@@ -69,18 +71,6 @@ def herdr_rpc(method: str, params: dict | None = None, timeout: float = 1.5) -> 
                 res += chunk
             if res:
                 return json.loads(res.decode().strip())
-    except Exception:
-        pass
-    return None
-
-
-def get_tty_for_pid(pid: int | str | None) -> str | None:
-    if not pid:
-        return None
-    try:
-        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "tty="], text=True).strip()
-        if out and out != "?" and not out.startswith("??"):
-            return f"/dev/{out}"
     except Exception:
         pass
     return None
@@ -200,11 +190,12 @@ def clean_task_title(text: str) -> str | None:
     # Strip markdown headers, blockquotes, bullets, and task checkboxes
     first_line = re.sub(r"^[\s\#\>\*\-\|]+", "", first_line).strip()
     first_line = re.sub(r"^\[[ xX]\]\s*", "", first_line).strip()
-    # Strip leading numbered list prefixes: 1. / 1) / (1) / [1]
-    first_line = re.sub(r"^(?:\d+[\.\:\：\)\/]|[\(\[]\d+[\)\]])\s*", "", first_line).strip()
-    # Strip trailing punctuation
-    first_line = re.sub(r"[\s\.\,\!\?\,\。\!\？]+$", "", first_line).strip()
-
+    # Strip leading list prefixes:
+    # 1) Numeric: 1. / 1) / (1) / [1] / 1: / 1：
+    # 2) Alphabetic: a. / b. / A. / B) / (a) / [b] / a: / a：
+    # 3) Roman: i. / ii. / I. / II.
+    first_line = re.sub(r"^(?:(?:[0-9]+|[a-zA-Z]|[ivxIVX]+)[\.\:\：\)\/]|[\(\[](?:[0-9]+|[a-zA-Z]|[ivxIVX]+)[\)\]])\s*", "", first_line).strip()
+    # Strip trailing punctuation, separators, and dashes
     first_line = sanitize_title(first_line)
     if not first_line or len(first_line) < 2:
         return None
@@ -212,7 +203,7 @@ def clean_task_title(text: str) -> str | None:
     return first_line[:32].strip()
 
 
-def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str = "") -> str | None:
+def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
     # 1. Authoritative check: ~/.claude/projects/*/{session_id}/custom-title.json
     if session_id:
         ct_pattern = os.path.expanduser(f"~/.claude/projects/*/{session_id}/custom-title.json")
@@ -222,7 +213,7 @@ def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str 
                 with open(ct_matches[0], "r", encoding="utf-8") as f:
                     d = json.load(f)
                     if d.get("customTitle"):
-                        return str(d["customTitle"]).strip()[:32]
+                        return sanitize_title(str(d["customTitle"]))[:32]
             except Exception:
                 pass
 
@@ -277,33 +268,7 @@ def extract_cc_session_name(session_id: str, cwd: str = "", terminal_title: str 
             if first_prompt_title:
                 return sanitize_title(first_prompt_title)[:32]
 
-    # 3. If session_id is missing or stale, try resolving from terminal_title across recent transcripts
-    if terminal_title and terminal_title not in {"claude", "zsh", "bash", "sh", "None"}:
-        candidate_files = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
-        # Sort by mtime, cap to top 5 recent files to prevent disk scan latency
-        candidate_files.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
-        for p in candidate_files[:5]:
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if terminal_title in line:
-                            d = json.loads(line)
-                            if d.get("agentName") == terminal_title or d.get("customTitle") == terminal_title:
-                                sid = d.get("sessionId")
-                                if sid:
-                                    ct_file = os.path.expanduser(f"~/.claude/projects/*/{sid}/custom-title.json")
-                                    ct_matches = glob.glob(ct_file)
-                                    if ct_matches:
-                                        with open(ct_matches[0], "r", encoding="utf-8") as h:
-                                            ct_data = json.load(h)
-                                            if ct_data.get("customTitle"):
-                                                return sanitize_title(str(ct_data["customTitle"]))[:32]
-                                res = d.get("customTitle") or d.get("agentName")
-                                return sanitize_title(res)[:32]
-            except Exception:
-                pass
-
-    # 4. Fallback to Git repository / Directory basename
+    # 3. Deterministic fallback to Git repository / Directory basename (strictly per-pane CWD, never fuzzy search)
     if cwd:
         base = os.path.basename(os.path.abspath(cwd))
         if base and base not in {"bytedance", "staff", "Desktop", "root", "~", "now"}:
@@ -317,11 +282,11 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     if not pane_id:
         return False
 
-    current_label = pane.get("label")
+    current_label = pane.get("label") or ""
     cwd = pane.get("foreground_cwd") or pane.get("cwd", "")
     agent_session = pane.get("agent_session") or {}
     session_id = agent_session.get("value")
-    terminal_title = pane.get("terminal_title") or pane.get("title") or ""
+    current_title = pane.get("terminal_title") or pane.get("title") or ""
 
     # Check live active mapping reported by Claude Code statusline
     statusline_mapping = Path(f"/tmp/.herdr-pane-sessions/{pane_id}.json")
@@ -337,7 +302,7 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         except Exception:
             pass
 
-    target_title = extract_cc_session_name(session_id, cwd, terminal_title)
+    target_title = extract_cc_session_name(session_id, cwd)
     if target_title and session_id:
         state.set_assigned_title(session_id, target_title)
 
@@ -358,38 +323,15 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         if res and "result" in res:
             updated = True
 
-    # 2. Sync Herdr Metadata (report title, preserve display_agent persona)
-    if current_label != target_title or terminal_title != target_title:
-        herdr_rpc("pane.report_metadata", {
+    # 2. Sync Herdr Metadata (report title cleanly via Unix Socket RPC; no direct TTY byte injection)
+    if current_label != target_title or current_title != target_title:
+        res = herdr_rpc("pane.report_metadata", {
             "pane_id": pane_id,
             "source": "herdr:claude",
             "title": target_title
         })
-
-    # 3. Directly update PTY xterm terminal_title via pane slave TTY (for Heeler card line 2)
-    if terminal_title != target_title:
-        pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
-        shell_pid = pinfo.get("result", {}).get("process_info", {}).get("shell_pid") if pinfo else None
-        tty_path = get_tty_for_pid(shell_pid)
-        if tty_path and os.path.exists(tty_path):
-            try:
-                with open(tty_path, "w") as tty_file:
-                    tty_file.write(f"\033]0;{target_title}\007")
-                    tty_file.flush()
-                updated = True
-            except Exception:
-                pass
-
-    return updated
-    tty_path = get_tty_for_pid(shell_pid)
-    if tty_path and os.path.exists(tty_path):
-        try:
-            with open(tty_path, "w") as tty_file:
-                tty_file.write(f"\033]0;{target_title}\007")
-                tty_file.flush()
+        if res and "result" in res:
             updated = True
-        except Exception:
-            pass
 
     return updated
 

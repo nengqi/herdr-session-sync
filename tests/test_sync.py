@@ -4,7 +4,7 @@ from pathlib import Path
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from sync import clean_task_title, sanitize_title
+from sync import clean_task_title, sanitize_title, extract_cc_session_name
 
 
 class TestSyncTitle(unittest.TestCase):
@@ -19,6 +19,9 @@ class TestSyncTitle(unittest.TestCase):
         text = "/codex:review 审查最近的代码变更"
         self.assertEqual(clean_task_title(text), "审查最近的代码变更")
 
+        text_rename = "/rename 我的新任务"
+        self.assertEqual(clean_task_title(text_rename), "我的新任务")
+
         # Utility commands should be filtered out even with arguments
         self.assertIsNone(clean_task_title("/compact please"))
         self.assertIsNone(clean_task_title("/help search"))
@@ -26,6 +29,18 @@ class TestSyncTitle(unittest.TestCase):
     def test_clean_markdown_and_bullets(self):
         text = "### 1. 排查并修复 Heeler 连接问题\n详细步骤如下..."
         self.assertEqual(clean_task_title(text), "排查并修复 Heeler 连接问题")
+
+        text_alpha = "b. CSI 词供给方案与数据验证白皮书\n正文开始"
+        self.assertEqual(clean_task_title(text_alpha), "CSI 词供给方案与数据验证白皮书")
+
+        text_paren = "(a) 搜索词召回方案"
+        self.assertEqual(clean_task_title(text_paren), "搜索词召回方案")
+
+        text_dash = "相关性 MCP - "
+        self.assertEqual(clean_task_title(text_dash), "相关性 MCP")
+
+        text_emdash = "相关性 MCP —"
+        self.assertEqual(clean_task_title(text_emdash), "相关性 MCP")
 
         # Balanced tags should not produce dangling brackets
         self.assertEqual(clean_task_title("- [x] Fix login bug"), "Fix login bug")
@@ -48,6 +63,12 @@ class TestSyncTitle(unittest.TestCase):
         self.assertEqual(sanitize_title("normal title"), "normal title")
         self.assertEqual(sanitize_title("title\x07\x1b[6ninjected"), "titleinjected")
         self.assertEqual(sanitize_title("\033[31mRed\033[0m"), "Red")
+        self.assertEqual(sanitize_title("title - — : "), "title")
+
+    def test_deterministic_fallback_no_cross_pollution(self):
+        # When session_id is empty/none, extract_cc_session_name must NOT scan other transcripts
+        self.assertIsNone(extract_cc_session_name("", cwd=""))
+        self.assertEqual(extract_cc_session_name("", cwd="/Users/bytedance/go/src/github.com/nengqi/Heeler"), "Heeler")
 
 
 if __name__ == "__main__":
