@@ -306,6 +306,12 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     if target_title and session_id:
         state.set_assigned_title(session_id, target_title)
 
+    # If transcript lookup returned nothing, fallback to the existing terminal_title on the pane
+    if not target_title and current_title:
+        clean_tt = sanitize_title(current_title)
+        if clean_tt and clean_tt not in {"claude", "zsh", "bash", "sh", "None", "current session"}:
+            target_title = clean_tt[:32]
+
     if not target_title and cwd:
         base = os.path.basename(os.path.abspath(cwd))
         if base and base not in {"bytedance", "staff", "Desktop", "root", "~", "now"}:
