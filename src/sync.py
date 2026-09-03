@@ -286,32 +286,22 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     cwd = pane.get("foreground_cwd") or pane.get("cwd", "")
     agent_session = pane.get("agent_session") or {}
     session_id = agent_session.get("value")
-    current_title = pane.get("terminal_title") or pane.get("title") or ""
+    terminal_title = pane.get("terminal_title") or ""
 
-    # Check live active mapping reported by Claude Code statusline
-    statusline_mapping = Path(f"/tmp/.herdr-pane-sessions/{pane_id}.json")
-    if statusline_mapping.exists():
-        try:
-            with open(statusline_mapping, "r", encoding="utf-8") as smf:
-                sdata = json.load(smf)
-                live_sid = sdata.get("session_id")
-                # TTL check: ignore mappings older than 2 hours
-                mapping_ts = sdata.get("ts", 0)
-                if live_sid and (time.time() - mapping_ts < 7200):
-                    session_id = live_sid
-        except Exception:
-            pass
+    target_title = None
 
-    target_title = extract_cc_session_name(session_id, cwd)
-    if target_title and session_id:
-        state.set_assigned_title(session_id, target_title)
-
-    # If transcript lookup returned nothing, fallback to the existing terminal_title on the pane
-    if not target_title and current_title:
-        clean_tt = sanitize_title(current_title)
+    # Priority 1: Physical PTY terminal title reported directly by the foreground interactive process.
+    # This is physically isolated to the pane's TTY and completely immune to background subagent pollution.
+    if terminal_title:
+        clean_tt = sanitize_title(terminal_title)
         if clean_tt and clean_tt not in {"claude", "zsh", "bash", "sh", "None", "current session"}:
             target_title = clean_tt[:32]
 
+    # Priority 2: If terminal title is empty, look up via authoritative session transcript
+    if not target_title and session_id:
+        target_title = extract_cc_session_name(session_id, cwd)
+
+    # Priority 3: Fallback strictly to CWD basename
     if not target_title and cwd:
         base = os.path.basename(os.path.abspath(cwd))
         if base and base not in {"bytedance", "staff", "Desktop", "root", "~", "now"}:
@@ -321,25 +311,13 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         return False
 
     target_title = sanitize_title(target_title)
-    updated = False
 
-    # 1. Sync Pane Label (for Mac 4-column border)
+    # Only update Pane Label if changed. NEVER tamper with underlying metadata/terminal title.
     if current_label != target_title:
         res = herdr_rpc("pane.rename", {"pane_id": pane_id, "label": target_title})
-        if res and "result" in res:
-            updated = True
+        return bool(res and "result" in res)
 
-    # 2. Sync Herdr Metadata (report title cleanly via Unix Socket RPC; no direct TTY byte injection)
-    if current_label != target_title or current_title != target_title:
-        res = herdr_rpc("pane.report_metadata", {
-            "pane_id": pane_id,
-            "source": "herdr:claude",
-            "title": target_title
-        })
-        if res and "result" in res:
-            updated = True
-
-    return updated
+    return False
 
 
 def sync_all(state: StateManager):
