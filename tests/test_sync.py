@@ -76,6 +76,55 @@ class TestSyncTitle(unittest.TestCase):
         self.assertIsNone(extract_cc_session_name("", cwd=""))
         self.assertEqual(extract_cc_session_name("", cwd="/Users/bytedance/go/src/github.com/nengqi/Heeler"), "Heeler")
 
+    def test_resolve_title_from_foreground_process_filtering(self):
+        from unittest.mock import patch
+        from sync import resolve_title_from_foreground_process
+
+        # Case 1: Non-claude command mentioning claude path (e.g. grep -r todo ~/.claude) must NOT hijack title
+        mock_pinfo_grep = {
+            "result": {
+                "process_info": {
+                    "foreground_processes": [
+                        {"argv0": "grep", "argv": ["grep", "-r", "todo", "/Users/bytedance/.claude"], "name": "grep"}
+                    ]
+                }
+            }
+        }
+        with patch("sync.herdr_rpc", return_value=mock_pinfo_grep):
+            sid, title = resolve_title_from_foreground_process("w1:p1")
+            self.assertIsNone(sid)
+            self.assertIsNone(title)
+
+        # Case 2: Claude with bare --resume and trailing flags must NOT capture the flag as a title
+        mock_pinfo_bare_flag = {
+            "result": {
+                "process_info": {
+                    "foreground_processes": [
+                        {"argv0": "claude", "argv": ["claude", "--resume", "--dangerously-skip-permissions"], "name": "claude"}
+                    ]
+                }
+            }
+        }
+        with patch("sync.herdr_rpc", return_value=mock_pinfo_bare_flag):
+            sid, title = resolve_title_from_foreground_process("w1:p1")
+            self.assertIsNone(sid)
+            self.assertIsNone(title)
+
+        # Case 3: Claude with explicit custom --name
+        mock_pinfo_name = {
+            "result": {
+                "process_info": {
+                    "foreground_processes": [
+                        {"argv0": "claude", "argv": ["claude", "--name", "Fix critical bug"], "name": "claude"}
+                    ]
+                }
+            }
+        }
+        with patch("sync.herdr_rpc", return_value=mock_pinfo_name):
+            sid, title = resolve_title_from_foreground_process("w1:p1")
+            self.assertIsNone(sid)
+            self.assertEqual(title, "Fix critical bug")
+
 
 if __name__ == "__main__":
     unittest.main()

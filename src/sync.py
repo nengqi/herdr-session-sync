@@ -302,22 +302,40 @@ def resolve_title_from_foreground_process(pane_id: str) -> tuple[str | None, str
         fg = pinfo.get("result", {}).get("process_info", {}).get("foreground_processes", [])
         for proc in fg:
             argv = proc.get("argv", [])
-            cmdline = proc.get("cmdline", "")
-            if any("claude" in str(arg) for arg in argv[:3]) or "claude" in cmdline:
-                for i, arg in enumerate(argv):
-                    if arg in {"attach", "--resume", "-r", "--name"} and i + 1 < len(argv):
-                        val = argv[i + 1].strip()
-                        # If val is a UUID or hex prefix
-                        if re.match(r"^[0-9a-fA-F-]{6,36}$", val):
-                            matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{val}*.jsonl"))
-                            for m in matches:
-                                if os.path.isfile(m):
-                                    sid = os.path.basename(m)[:-6]
-                                    title = extract_cc_session_name(sid)
-                                    if title:
-                                        return sid, title
-                        else:
-                            return None, sanitize_title(val)[:32]
+            if not argv:
+                continue
+            argv0 = os.path.basename(proc.get("argv0") or (argv[0] if argv else ""))
+            name = proc.get("name", "")
+
+            # Require the executable itself to be claude, a node runner for claude, or a shell wrapper invoking claude
+            is_claude = (
+                "claude" in argv0
+                or "claude" in name
+                or (argv0 in {"node", "nodejs", "bun"} and len(argv) > 1 and "claude" in os.path.basename(argv[1]))
+                or (argv0 in {"sh", "bash", "zsh"} and any(os.path.basename(a) == "claude" for a in argv[1:3]))
+            )
+            if not is_claude:
+                continue
+
+            for i, arg in enumerate(argv):
+                flag, sep, inline_val = arg.partition("=")
+                val = inline_val if sep else (argv[i + 1].strip() if i + 1 < len(argv) else "")
+                if not val or val.startswith("-"):
+                    continue
+
+                if flag in {"attach", "--resume", "-r"}:
+                    if re.match(r"^[0-9a-fA-F-]{6,36}$", val):
+                        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{val}*.jsonl"))
+                        for m in matches:
+                            if os.path.isfile(m):
+                                sid = os.path.basename(m)[:-6]
+                                title = extract_cc_session_name(sid)
+                                if title:
+                                    return sid, title
+                    elif flag != "attach":
+                        return None, sanitize_title(val)[:32]
+                elif flag in {"--name", "-n"}:
+                    return None, sanitize_title(val)[:32]
     except Exception:
         pass
     return None, None
