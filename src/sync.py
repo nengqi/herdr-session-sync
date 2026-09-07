@@ -293,14 +293,69 @@ def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
     return None
 
 
+def is_valid_cc_session(session_id: str) -> bool:
+    """Checks whether a given session ID exists on disk as a non-empty transcript."""
+    if not session_id or not isinstance(session_id, str):
+        return False
+    session_id = session_id.strip()
+    if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
+        return False
+    matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+    for m in matches:
+        try:
+            if os.path.isfile(m) and os.path.getsize(m) > 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def resolve_session_from_pid(pid: int) -> tuple[str | None, str | None]:
+    """Reads ~/.claude/sessions/{pid}.json to extract authoritative Root Session ID and title."""
+    if not pid or not isinstance(pid, int) or pid <= 0:
+        return None, None
+    session_file = os.path.expanduser(f"~/.claude/sessions/{pid}.json")
+    if not os.path.isfile(session_file):
+        return None, None
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        session_id = data.get("sessionId")
+        if not session_id or not isinstance(session_id, str):
+            return None, None
+        session_id = session_id.strip()
+        if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
+            return None, None
+
+        if not is_valid_cc_session(session_id):
+            return None, None
+
+        title = extract_cc_session_name(session_id)
+        if not title:
+            raw_name = data.get("name")
+            if raw_name and isinstance(raw_name, str):
+                title = sanitize_title(raw_name)[:32]
+        return session_id, title
+    except Exception:
+        pass
+    return None, None
+
+
 def resolve_title_from_foreground_process(pane_id: str) -> tuple[str | None, str | None]:
-    """Inspects pane.process_info to resolve session_id and title directly from CLI args (attach/--resume/--name)."""
+    """Inspects pane.process_info to resolve session_id and title directly from PID or CLI args (attach/--resume/--name)."""
     try:
         pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
         if not pinfo:
             return None, None
         fg = pinfo.get("result", {}).get("process_info", {}).get("foreground_processes", [])
         for proc in fg:
+            # 1. Authoritative check via process PID -> ~/.claude/sessions/{pid}.json
+            proc_pid = proc.get("pid")
+            if isinstance(proc_pid, int):
+                sid, title = resolve_session_from_pid(proc_pid)
+                if sid:
+                    return sid, title
+
             argv = proc.get("argv", [])
             if not argv:
                 continue
@@ -330,8 +385,7 @@ def resolve_title_from_foreground_process(pane_id: str) -> tuple[str | None, str
                             if os.path.isfile(m):
                                 sid = os.path.basename(m)[:-6]
                                 title = extract_cc_session_name(sid)
-                                if title:
-                                    return sid, title
+                                return sid, title
                     elif flag != "attach":
                         return None, sanitize_title(val)[:32]
                 elif flag in {"--name", "-n"}:
@@ -355,17 +409,33 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
 
     target_title = None
 
-    # Priority 1: Direct foreground process inspection (attach/--resume/--name)
+    # Priority 1: Direct foreground process inspection (PID -> sessions/{pid}.json or CLI args)
     # Physically immune to stale Herdr state or background subagent hijacking
     fg_sid, fg_title = resolve_title_from_foreground_process(pane_id)
-    if fg_title:
-        target_title = fg_title
-        if fg_sid:
+    if fg_sid and is_valid_cc_session(fg_sid):
+        # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
+        # report the authoritative session back to Herdr.
+        if session_id != fg_sid:
+            herdr_rpc("pane.report_agent_session", {
+                "pane_id": pane_id,
+                "source": "herdr:claude",
+                "agent": "claude",
+                "agent_session_id": fg_sid,
+            })
             session_id = fg_sid
+
+        if fg_title:
+            target_title = fg_title
             state.set_assigned_title(session_id, target_title)
+    elif fg_title:
+        target_title = fg_title
+
+    # Validate existing session_id if no authoritative foreground session was resolved
+    if session_id and not is_valid_cc_session(session_id):
+        session_id = None
 
     # Priority 2: Authoritative session transcript / custom-title.json (/rename)
-    # When a Claude Code session is active on this pane, its transcript and custom-title.json
+    # When a valid Claude Code session is active on this pane, its transcript and custom-title.json
     # represent the genuine, authoritative task identity.
     if not target_title and session_id:
         target_title = extract_cc_session_name(session_id, cwd)
