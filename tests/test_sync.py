@@ -126,6 +126,52 @@ class TestSyncTitle(unittest.TestCase):
             self.assertEqual(title, "Fix critical bug")
 
 
+        # Case 4: Non-claude command with recycled PID matching stale session file must NOT be resolved
+        mock_pinfo_recycled = {
+            "result": {
+                "process_info": {
+                    "foreground_processes": [
+                        {"argv0": "btop", "argv": ["btop"], "name": "btop", "pid": 9999}
+                    ]
+                }
+            }
+        }
+        with patch("sync.herdr_rpc", return_value=mock_pinfo_recycled), \
+             patch("sync.resolve_session_from_pid") as mock_res_pid:
+            sid, title = resolve_title_from_foreground_process("w1:p1")
+            self.assertIsNone(sid)
+            self.assertIsNone(title)
+            # resolve_session_from_pid must never be called for non-Claude process
+            mock_res_pid.assert_not_called()
+
+        # Case 5: Resume argument skips orphaned cleanup transcripts and selects newest
+        mock_pinfo_resume = {
+            "result": {
+                "process_info": {
+                    "foreground_processes": [
+                        {"argv0": "claude", "argv": ["claude", "--resume", "12345678-1234-1234-1234-123456789abc"], "name": "claude", "pid": 0}
+                    ]
+                }
+            }
+        }
+        orphaned_path = "/path/projects/p1/12345678-1234-1234-1234-123456789abc.orphaned-123.jsonl"
+        valid_path = "/path/projects/p1/12345678-1234-1234-1234-123456789abc.jsonl"
+        with patch("sync.herdr_rpc", return_value=mock_pinfo_resume), \
+             patch("sync.glob.glob", return_value=[orphaned_path, valid_path]), \
+             patch("sync.os.path.isfile", return_value=True), \
+             patch("sync.os.path.getmtime", side_effect=lambda p: 200 if p == valid_path else 100), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value="Resume Task"):
+            sid, title = resolve_title_from_foreground_process("w1:p1")
+            self.assertEqual(sid, "12345678-1234-1234-1234-123456789abc")
+            self.assertEqual(title, "Resume Task")
+
+    def test_portable_home_dir_fallback(self):
+        from pathlib import Path
+        # Opening shell directly in user's home directory must return None, not the username
+        home_dir = str(Path.home())
+        self.assertIsNone(extract_cc_session_name("", cwd=home_dir))
+
     def test_is_valid_cc_session(self):
         from unittest.mock import patch
         from sync import is_valid_cc_session
@@ -164,33 +210,37 @@ class TestSyncTitle(unittest.TestCase):
         with patch("sync.os.path.isfile", return_value=False):
             self.assertEqual(resolve_session_from_pid(1234), (None, None))
 
-        # Valid pid file with valid session and custom title
-        valid_json = json.dumps({
+        # Valid interactive session file with custom extracted title
+        valid_interactive_json = json.dumps({
             "pid": 1234,
+            "kind": "interactive",
             "sessionId": "12345678-1234-1234-1234-123456789abc",
             "name": "Fallback Name"
         })
         with patch("sync.os.path.isfile", return_value=True), \
-             patch("builtins.open", mock_open(read_data=valid_json)), \
-             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("builtins.open", mock_open(read_data=valid_interactive_json)), \
              patch("sync.extract_cc_session_name", return_value="Extracted Title"):
             sid, title = resolve_session_from_pid(1234)
             self.assertEqual(sid, "12345678-1234-1234-1234-123456789abc")
             self.assertEqual(title, "Extracted Title")
 
-        # Valid pid file falling back to JSON name when transcript title not found
+        # Freshly started session before transcript exists: falls back to JSON 'name'
         with patch("sync.os.path.isfile", return_value=True), \
-             patch("builtins.open", mock_open(read_data=valid_json)), \
-             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("builtins.open", mock_open(read_data=valid_interactive_json)), \
              patch("sync.extract_cc_session_name", return_value=None):
             sid, title = resolve_session_from_pid(1234)
             self.assertEqual(sid, "12345678-1234-1234-1234-123456789abc")
             self.assertEqual(title, "Fallback Name")
 
-        # Valid pid file but session is ghost / not on disk
+        # Non-interactive session (e.g. kind="bg" background subagent/worker) must be rejected
+        bg_json = json.dumps({
+            "pid": 1234,
+            "kind": "bg",
+            "sessionId": "12345678-1234-1234-1234-123456789abc",
+            "name": "bg-worker"
+        })
         with patch("sync.os.path.isfile", return_value=True), \
-             patch("builtins.open", mock_open(read_data=valid_json)), \
-             patch("sync.is_valid_cc_session", return_value=False):
+             patch("builtins.open", mock_open(read_data=bg_json)):
             self.assertEqual(resolve_session_from_pid(1234), (None, None))
 
     def test_sync_pane_auto_heals_drifted_session(self):
@@ -212,33 +262,37 @@ class TestSyncTitle(unittest.TestCase):
             return {"result": {"ok": True}}
 
         with patch("sync.resolve_title_from_foreground_process", return_value=("authoritative-uuid-1234", "Authoritative Title")), \
-             patch("sync.is_valid_cc_session", return_value=True), \
              patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
             updated = sync_pane(mock_pane, mock_state)
             self.assertTrue(updated)
 
-            # Assert pane.report_agent_session was called with authoritative id
+            # Assert pane.report_agent_session was called with authoritative id, seq, and resume source
             report_calls = [c for c in rpc_calls if c[0] == "pane.report_agent_session"]
             self.assertEqual(len(report_calls), 1)
-            self.assertEqual(report_calls[0][1]["pane_id"], "w1:p1")
-            self.assertEqual(report_calls[0][1]["agent_session_id"], "authoritative-uuid-1234")
+            p = report_calls[0][1]
+            self.assertEqual(p["pane_id"], "w1:p1")
+            self.assertEqual(p["agent_session_id"], "authoritative-uuid-1234")
+            self.assertIsInstance(p.get("seq"), int)
+            self.assertGreater(p.get("seq"), 0)
+            self.assertEqual(p.get("session_start_source"), "resume")
 
             # Assert pane.rename and pane.report_metadata were also called
             rename_calls = [c for c in rpc_calls if c[0] == "pane.rename"]
             self.assertEqual(len(rename_calls), 1)
             self.assertEqual(rename_calls[0][1]["label"], "Authoritative Title")
 
-    def test_sync_pane_discards_ghost_session_without_foreground(self):
+    def test_sync_pane_prefers_terminal_title_when_claude_exited(self):
         from unittest.mock import patch, MagicMock
         from sync import sync_pane, StateManager
 
         mock_state = MagicMock(spec=StateManager)
         mock_pane = {
             "pane_id": "w1:p2",
-            "label": "Old Label",
-            "title": "Old Title",
+            "label": "Old Claude Task",
+            "title": "Old Claude Task",
             "terminal_title": "btop",
-            "agent_session": {"value": "ghost-subagent-uuid-000"},
+            # Even when agent_session points to a valid historical transcript on disk
+            "agent_session": {"value": "historical-session-uuid-1234"},
             "cwd": "/Users/bytedance/project",
         }
 
@@ -247,17 +301,38 @@ class TestSyncTitle(unittest.TestCase):
             rpc_calls.append((method, params))
             return {"result": {"ok": True}}
 
+        # When Claude is not in foreground, resolve_title_from_foreground_process returns (None, None)
+        # Even if is_valid_cc_session is True (transcript exists), terminal_title 'btop' MUST be preferred
         with patch("sync.resolve_title_from_foreground_process", return_value=(None, None)), \
-             patch("sync.is_valid_cc_session", return_value=False), \
+             patch("sync.is_valid_cc_session", return_value=True), \
              patch("sync.extract_cc_session_name") as mock_extract, \
              patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
             updated = sync_pane(mock_pane, mock_state)
             self.assertTrue(updated)
-            # Must NOT attempt to look up ghost session name
+            # Must NOT attempt to look up stale transcript when terminal has active tool title
             mock_extract.assert_not_called()
-            # Must fall back to terminal_title 'btop'
+            # Must rename pane to terminal_title 'btop'
             rename_calls = [c for c in rpc_calls if c[0] == "pane.rename"]
             self.assertEqual(rename_calls[0][1]["label"], "btop")
+
+    def test_get_state_dir_catches_oserror(self):
+        from unittest.mock import patch
+        from sync import get_state_dir
+
+        with patch("pathlib.Path.mkdir", side_effect=OSError("Read-only file system")):
+            # Must catch OSError gracefully and still return Path without crashing
+            path = get_state_dir()
+            self.assertIsNotNone(path)
+
+    def test_cwd_fallback_dynamic_username_filtering(self):
+        from unittest.mock import patch
+        from pathlib import Path
+
+        # Dynamic filtering of Path.home().name without hardcoding username
+        mock_home = Path("/home/testuser")
+        with patch("pathlib.Path.home", return_value=mock_home):
+            self.assertIsNone(extract_cc_session_name("", cwd=str(mock_home)))
+            self.assertEqual(extract_cc_session_name("", cwd="/home/testuser/herdr"), "herdr")
 
 
 if __name__ == "__main__":
