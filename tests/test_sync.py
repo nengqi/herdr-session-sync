@@ -126,5 +126,139 @@ class TestSyncTitle(unittest.TestCase):
             self.assertEqual(title, "Fix critical bug")
 
 
+    def test_is_valid_cc_session(self):
+        from unittest.mock import patch
+        from sync import is_valid_cc_session
+
+        # Invalid format
+        self.assertFalse(is_valid_cc_session(""))
+        self.assertFalse(is_valid_cc_session("../evil/path"))
+        self.assertFalse(is_valid_cc_session("not-hex-@#$"))
+
+        # Valid format but no files
+        with patch("sync.glob.glob", return_value=[]):
+            self.assertFalse(is_valid_cc_session("12345678-1234-1234-1234-123456789abc"))
+
+        # Valid format, file exists but 0 bytes (corrupted/ghost)
+        with patch("sync.glob.glob", return_value=["/path/to/transcript.jsonl"]), \
+             patch("sync.os.path.isfile", return_value=True), \
+             patch("sync.os.path.getsize", return_value=0):
+            self.assertFalse(is_valid_cc_session("12345678-1234-1234-1234-123456789abc"))
+
+        # Valid format and non-empty file
+        with patch("sync.glob.glob", return_value=["/path/to/transcript.jsonl"]), \
+             patch("sync.os.path.isfile", return_value=True), \
+             patch("sync.os.path.getsize", return_value=1024):
+            self.assertTrue(is_valid_cc_session("12345678-1234-1234-1234-123456789abc"))
+
+    def test_resolve_session_from_pid(self):
+        import json
+        from unittest.mock import patch, mock_open
+        from sync import resolve_session_from_pid
+
+        # Invalid pid
+        self.assertEqual(resolve_session_from_pid(0), (None, None))
+        self.assertEqual(resolve_session_from_pid(-1), (None, None))
+
+        # Pid file does not exist
+        with patch("sync.os.path.isfile", return_value=False):
+            self.assertEqual(resolve_session_from_pid(1234), (None, None))
+
+        # Valid pid file with valid session and custom title
+        valid_json = json.dumps({
+            "pid": 1234,
+            "sessionId": "12345678-1234-1234-1234-123456789abc",
+            "name": "Fallback Name"
+        })
+        with patch("sync.os.path.isfile", return_value=True), \
+             patch("builtins.open", mock_open(read_data=valid_json)), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value="Extracted Title"):
+            sid, title = resolve_session_from_pid(1234)
+            self.assertEqual(sid, "12345678-1234-1234-1234-123456789abc")
+            self.assertEqual(title, "Extracted Title")
+
+        # Valid pid file falling back to JSON name when transcript title not found
+        with patch("sync.os.path.isfile", return_value=True), \
+             patch("builtins.open", mock_open(read_data=valid_json)), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value=None):
+            sid, title = resolve_session_from_pid(1234)
+            self.assertEqual(sid, "12345678-1234-1234-1234-123456789abc")
+            self.assertEqual(title, "Fallback Name")
+
+        # Valid pid file but session is ghost / not on disk
+        with patch("sync.os.path.isfile", return_value=True), \
+             patch("builtins.open", mock_open(read_data=valid_json)), \
+             patch("sync.is_valid_cc_session", return_value=False):
+            self.assertEqual(resolve_session_from_pid(1234), (None, None))
+
+    def test_sync_pane_auto_heals_drifted_session(self):
+        from unittest.mock import patch, MagicMock
+        from sync import sync_pane, StateManager
+
+        mock_state = MagicMock(spec=StateManager)
+        mock_pane = {
+            "pane_id": "w1:p1",
+            "label": "Old Label",
+            "title": "Old Title",
+            "agent_session": {"value": "ghost-subagent-uuid-000"},
+            "cwd": "/Users/bytedance/project",
+        }
+
+        rpc_calls = []
+        def fake_herdr_rpc(method, params=None, timeout=1.5):
+            rpc_calls.append((method, params))
+            return {"result": {"ok": True}}
+
+        with patch("sync.resolve_title_from_foreground_process", return_value=("authoritative-uuid-1234", "Authoritative Title")), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
+            updated = sync_pane(mock_pane, mock_state)
+            self.assertTrue(updated)
+
+            # Assert pane.report_agent_session was called with authoritative id
+            report_calls = [c for c in rpc_calls if c[0] == "pane.report_agent_session"]
+            self.assertEqual(len(report_calls), 1)
+            self.assertEqual(report_calls[0][1]["pane_id"], "w1:p1")
+            self.assertEqual(report_calls[0][1]["agent_session_id"], "authoritative-uuid-1234")
+
+            # Assert pane.rename and pane.report_metadata were also called
+            rename_calls = [c for c in rpc_calls if c[0] == "pane.rename"]
+            self.assertEqual(len(rename_calls), 1)
+            self.assertEqual(rename_calls[0][1]["label"], "Authoritative Title")
+
+    def test_sync_pane_discards_ghost_session_without_foreground(self):
+        from unittest.mock import patch, MagicMock
+        from sync import sync_pane, StateManager
+
+        mock_state = MagicMock(spec=StateManager)
+        mock_pane = {
+            "pane_id": "w1:p2",
+            "label": "Old Label",
+            "title": "Old Title",
+            "terminal_title": "btop",
+            "agent_session": {"value": "ghost-subagent-uuid-000"},
+            "cwd": "/Users/bytedance/project",
+        }
+
+        rpc_calls = []
+        def fake_herdr_rpc(method, params=None, timeout=1.5):
+            rpc_calls.append((method, params))
+            return {"result": {"ok": True}}
+
+        with patch("sync.resolve_title_from_foreground_process", return_value=(None, None)), \
+             patch("sync.is_valid_cc_session", return_value=False), \
+             patch("sync.extract_cc_session_name") as mock_extract, \
+             patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
+            updated = sync_pane(mock_pane, mock_state)
+            self.assertTrue(updated)
+            # Must NOT attempt to look up ghost session name
+            mock_extract.assert_not_called()
+            # Must fall back to terminal_title 'btop'
+            rename_calls = [c for c in rpc_calls if c[0] == "pane.rename"]
+            self.assertEqual(rename_calls[0][1]["label"], "btop")
+
+
 if __name__ == "__main__":
     unittest.main()
