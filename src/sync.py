@@ -187,14 +187,16 @@ def clean_task_title(text: str) -> str | None:
 
     # Take first line
     first_line = text.split("\n")[0].strip()
-    # Strip markdown headers, blockquotes, bullets, and task checkboxes
-    first_line = re.sub(r"^[\s\#\>\*\-\|]+", "", first_line).strip()
+    # Strip markdown headers, blockquotes, bullets, quotes, backticks, and task checkboxes
+    first_line = re.sub(r"^[\s\#\>\*\-\|\`\'\"•·]+", "", first_line).strip()
     first_line = re.sub(r"^\[[ xX]\]\s*", "", first_line).strip()
     # Strip leading list prefixes:
     # 1) Numeric: 1. / 1) / (1) / [1] / 1: / 1：
     # 2) Alphabetic: a. / b. / A. / B) / (a) / [b] / a: / a：
     # 3) Roman: i. / ii. / I. / II.
     first_line = re.sub(r"^(?:(?:[0-9]+|[a-zA-Z]|[ivxIVX]+)[\.\:\：\)\/]|[\(\[](?:[0-9]+|[a-zA-Z]|[ivxIVX]+)[\)\]])\s*", "", first_line).strip()
+    # Clean leading formatting again after list prefix removal
+    first_line = re.sub(r"^[\s\#\>\*\-\|\`\'\"•·]+", "", first_line).strip()
     # Strip trailing punctuation, separators, and dashes
     first_line = sanitize_title(first_line)
     if not first_line or len(first_line) < 2:
@@ -225,41 +227,55 @@ def extract_cc_session_name(session_id: str, cwd: str = "") -> str | None:
             last_custom_title = None
             first_prompt_title = None
 
-            try:
-                with open(transcript_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            d = json.loads(line)
-                            # Exact customTitle or agentName set in Claude Code
-                            if d.get("customTitle"):
-                                last_custom_title = str(d["customTitle"]).strip()
-                            elif d.get("agentName"):
-                                last_custom_title = str(d["agentName"]).strip()
+            def parse_line_obj(line_str: str):
+                nonlocal last_custom_title, first_prompt_title
+                try:
+                    d = json.loads(line_str)
+                    if d.get("customTitle"):
+                        last_custom_title = str(d["customTitle"]).strip()
+                    elif d.get("agentName"):
+                        last_custom_title = str(d["agentName"]).strip()
 
-                            # First real user prompt as fallback
-                            if (
-                                not first_prompt_title
-                                and d.get("type") == "user"
-                                and not d.get("isMeta")
-                                and not d.get("turnCompanion")
-                                and d.get("message", {}).get("role") == "user"
-                            ):
-                                content = d.get("message", {}).get("content")
-                                raw_text = ""
-                                if isinstance(content, str):
-                                    raw_text = content
-                                elif isinstance(content, list) and content:
-                                    for item in content:
-                                        if isinstance(item, dict) and item.get("type") == "text":
-                                            t = item.get("text", "")
-                                            if not t.startswith("<system-reminder>") and "Base directory for this skill:" not in t:
-                                                raw_text = t
-                                                break
-                                title = clean_task_title(raw_text)
-                                if title:
-                                    first_prompt_title = title
-                        except Exception:
-                            pass
+                    if (
+                        not first_prompt_title
+                        and d.get("type") == "user"
+                        and not d.get("isMeta")
+                        and not d.get("turnCompanion")
+                        and d.get("message", {}).get("role") == "user"
+                    ):
+                        content = d.get("message", {}).get("content")
+                        raw_text = ""
+                        if isinstance(content, str):
+                            raw_text = content
+                        elif isinstance(content, list) and content:
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    t = item.get("text", "")
+                                    if not t.startswith("<system-reminder>") and "Base directory for this skill:" not in t:
+                                        raw_text = t
+                                        break
+                        title = clean_task_title(raw_text)
+                        if title:
+                            first_prompt_title = title
+                except Exception:
+                    pass
+
+            try:
+                fsize = os.path.getsize(transcript_path)
+                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                    if fsize > 524288:
+                        # Bounded read: first 128KB for first user prompt
+                        head_chunk = f.read(131072)
+                        for line in head_chunk.splitlines():
+                            parse_line_obj(line)
+                        # Seek to tail 128KB for latest customTitle / agentName
+                        f.seek(max(0, fsize - 131072))
+                        tail_chunk = f.read()
+                        for line in tail_chunk.splitlines():
+                            parse_line_obj(line)
+                    else:
+                        for line in f:
+                            parse_line_obj(line)
             except Exception:
                 pass
 
@@ -293,12 +309,13 @@ def resolve_title_from_foreground_process(pane_id: str) -> tuple[str | None, str
                         val = argv[i + 1].strip()
                         # If val is a UUID or hex prefix
                         if re.match(r"^[0-9a-fA-F-]{6,36}$", val):
-                            matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{val}*"))
+                            matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{val}*.jsonl"))
                             for m in matches:
-                                sid = os.path.basename(m).replace(".jsonl", "")
-                                title = extract_cc_session_name(sid)
-                                if title:
-                                    return sid, title
+                                if os.path.isfile(m):
+                                    sid = os.path.basename(m)[:-6]
+                                    title = extract_cc_session_name(sid)
+                                    if title:
+                                        return sid, title
                         else:
                             return None, sanitize_title(val)[:32]
     except Exception:

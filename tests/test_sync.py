@@ -46,6 +46,12 @@ class TestSyncTitle(unittest.TestCase):
         self.assertEqual(clean_task_title("- [x] Fix login bug"), "Fix login bug")
         self.assertEqual(clean_task_title("[Feature] Add auth system"), "[Feature] Add auth system")
 
+        # Quotes and backticks should be stripped cleanly
+        self.assertEqual(clean_task_title("`git status` failing with error"), "git status` failing with error")
+        self.assertEqual(clean_task_title('"Fix build error" now'), 'Fix build error" now')
+        self.assertEqual(clean_task_title("• 排查并修复网络故障"), "排查并修复网络故障")
+        self.assertEqual(clean_task_title("· 整理 memory 文件"), "整理 memory 文件")
+
     def test_filter_system_and_greetings(self):
         self.assertIsNone(clean_task_title("好的"))
         self.assertIsNone(clean_task_title("<system-reminder>test</system-reminder>"))
