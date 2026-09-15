@@ -407,6 +407,39 @@ def resolve_title_from_foreground_process(pane_id: str, cwd: str = "") -> tuple[
     return None, None
 
 
+def extract_title_from_screen(pane_id: str) -> str | None:
+    """Inspects the live visible terminal buffer to extract the active Claude Code session title
+
+    rendered in the readline bar: ──── <Title> ─
+    """
+    try:
+        res = herdr_rpc("pane.read", {"pane_id": pane_id, "source": "recent", "lines": 25})
+        if not res:
+            return None
+        text = res.get("result", {}).get("read", {}).get("text", "")
+        if not text:
+            return None
+        for line in text.splitlines():
+            m = re.search(r"[─\─\—\-]{3,}\s*(.+?)\s*[─\─\—\-]+$", line)
+            if m:
+                candidate = m.group(1).strip()
+                ignored_keywords = {
+                    "focus", "agents", "options", "recap", "permissions", "shift+tab",
+                    "bypass permissions", "auto mode", "plan mode", "manual mode",
+                    "accept edits", "dontask", "task",
+                }
+                if (
+                    candidate
+                    and candidate.lower() not in ignored_keywords
+                    and not candidate.startswith("http")
+                    and len(candidate) >= 2
+                ):
+                    return sanitize_title(candidate)[:32]
+    except Exception:
+        pass
+    return None
+
+
 def sync_pane(pane: dict, state: StateManager) -> bool:
     pane_id = pane.get("pane_id")
     if not pane_id:
@@ -421,44 +454,51 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
 
     target_title = None
 
-    # Priority 1: Direct foreground process inspection (PID -> sessions/{pid}.json or CLI args)
+    # Priority 1: Live screen readline bar title directly rendered by Claude Code (e.g. ──── 诊断-实验参数抓取 ─)
+    # Reflects live in-session /rename or session title with 100% visual fidelity.
+    screen_title = extract_title_from_screen(pane_id)
+    if screen_title:
+        target_title = screen_title
+
+    # Priority 2: Direct foreground process inspection (PID -> sessions/{pid}.json or CLI args)
     # Physically immune to stale Herdr state or background subagent hijacking
-    fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd)
-    if fg_sid:
-        # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
-        # report the authoritative session back to Herdr with monotonic sequence and resume source.
-        if session_id != fg_sid:
-            herdr_rpc("pane.report_agent_session", {
-                "pane_id": pane_id,
-                "source": "herdr:claude",
-                "agent": "claude",
-                "agent_session_id": fg_sid,
-                "seq": time.time_ns(),
-                "session_start_source": "resume",
-            })
-            session_id = fg_sid
+    if not target_title:
+        fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd)
+        if fg_sid:
+            # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
+            # report the authoritative session back to Herdr with monotonic sequence and resume source.
+            if session_id != fg_sid:
+                herdr_rpc("pane.report_agent_session", {
+                    "pane_id": pane_id,
+                    "source": "herdr:claude",
+                    "agent": "claude",
+                    "agent_session_id": fg_sid,
+                    "seq": time.time_ns(),
+                    "session_start_source": "resume",
+                })
+                session_id = fg_sid
 
-        if fg_title:
+            if fg_title:
+                target_title = fg_title
+                state.set_assigned_title(session_id, target_title)
+        elif fg_title:
             target_title = fg_title
-            state.set_assigned_title(session_id, target_title)
-    elif fg_title:
-        target_title = fg_title
 
-    # Priority 2: When Claude is not running in foreground, prioritize physical PTY terminal title
+    # Priority 3: When Claude is not running in foreground, prioritize physical PTY terminal title
     # (e.g. btop, yazi, vim, git, etc.) over stale historical session transcript
     if not target_title and terminal_title:
         clean_tt = sanitize_title(terminal_title)
         if clean_tt and clean_tt not in {"claude", "zsh", "bash", "sh", "None", "current session"}:
             target_title = clean_tt[:32]
 
-    # Priority 3: Historical session transcript / custom-title.json
+    # Priority 4: Historical session transcript / custom-title.json
     # Only fallback to session transcript if terminal_title is generic shell/absent
     if not target_title and session_id and is_valid_cc_session(session_id):
         target_title = extract_cc_session_name(session_id, cwd)
         if target_title:
             state.set_assigned_title(session_id, target_title)
 
-    # Priority 4: Fallback strictly to CWD basename (portable, non-home)
+    # Priority 5: Fallback strictly to CWD basename (portable, non-home)
     if not target_title and cwd:
         abs_cwd = Path(cwd).resolve()
         if abs_cwd != Path.home().resolve() and abs_cwd != Path("/"):
