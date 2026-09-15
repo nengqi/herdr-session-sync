@@ -336,8 +336,10 @@ def resolve_session_from_pid(pid: int) -> tuple[str | None, str | None]:
 
         title = extract_cc_session_name(session_id)
         if not title:
+            name_source = data.get("nameSource")
             raw_name = data.get("name")
-            if raw_name and isinstance(raw_name, str):
+            # Only adopt data.get("name") if it is a real user/peer name, NOT an auto-derived directory slug (e.g. bytedance-5d)
+            if raw_name and isinstance(raw_name, str) and name_source != "derived":
                 title = sanitize_title(raw_name)[:32]
         return session_id, title
     except Exception:
