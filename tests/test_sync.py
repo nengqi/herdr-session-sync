@@ -262,6 +262,7 @@ class TestSyncTitle(unittest.TestCase):
             return {"result": {"ok": True}}
 
         with patch("sync.resolve_title_from_foreground_process", return_value=("authoritative-uuid-1234", "Authoritative Title")), \
+             patch("sync.is_valid_cc_session", return_value=True), \
              patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
             updated = sync_pane(mock_pane, mock_state)
             self.assertTrue(updated)
@@ -333,6 +334,36 @@ class TestSyncTitle(unittest.TestCase):
         with patch("pathlib.Path.home", return_value=mock_home):
             self.assertIsNone(extract_cc_session_name("", cwd=str(mock_home)))
             self.assertEqual(extract_cc_session_name("", cwd="/home/testuser/herdr"), "herdr")
+
+
+    def test_sync_pane_skips_unwritten_session(self):
+        """A foreground session whose transcript .jsonl does not exist yet must NOT be
+        persisted to Herdr, otherwise `claude --resume` fails after a restart with
+        "No conversation found with session ID"."""
+        from unittest.mock import patch, MagicMock
+        from sync import sync_pane, StateManager
+
+        mock_state = MagicMock(spec=StateManager)
+        mock_pane = {
+            "pane_id": "w1:p1",
+            "label": "Old Label",
+            "title": "Old Title",
+            "agent_session": {"value": "previous-uuid-000"},
+            "cwd": "/Users/bytedance/project",
+        }
+
+        rpc_calls = []
+
+        def fake_herdr_rpc(method, params=None, timeout=1.5):
+            rpc_calls.append((method, params))
+            return {"result": {"ok": True}}
+
+        with patch("sync.resolve_title_from_foreground_process", return_value=("unwritten-uuid-9999", "Some Title")), \
+             patch("sync.is_valid_cc_session", return_value=False), \
+             patch("sync.herdr_rpc", side_effect=fake_herdr_rpc):
+            sync_pane(mock_pane, mock_state)
+            report_calls = [c for c in rpc_calls if c[0] == "pane.report_agent_session"]
+            self.assertEqual(len(report_calls), 0, "unwritten session must not be reported to Herdr")
 
 
 if __name__ == "__main__":

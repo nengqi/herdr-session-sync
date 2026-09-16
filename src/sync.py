@@ -467,7 +467,11 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         if fg_sid:
             # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
             # report the authoritative session back to Herdr with monotonic sequence and resume source.
-            if session_id != fg_sid:
+            # Durability guard: a session UUID is allocated at SessionStart but its transcript .jsonl is only
+            # written once the first user message lands. Persisting an unwritten UUID makes `claude --resume`
+            # fail with "No conversation found with session ID" after a Herdr restart, so only report a
+            # session that is already durable on disk.
+            if session_id != fg_sid and is_valid_cc_session(fg_sid):
                 herdr_rpc("pane.report_agent_session", {
                     "pane_id": pane_id,
                     "source": "herdr:claude",
