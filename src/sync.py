@@ -364,14 +364,30 @@ def resolve_parked_job_session(job_id: str) -> tuple[str | None, str | None]:
 
 
 def resolve_live_bg_session_by_name(name: str) -> tuple[str | None, str | None]:
-    """Finds the live background session whose peer-assigned name matches `name`.
+    """Finds the live background session whose reported name matches `name`.
 
-    Used when a pane's foreground interactive process has no transcript of its own: it
-    is viewing a background session, and `~/.claude/sessions/<pid>.json` carries no
-    usable link to it (`parkedJobId` frequently points at a job that no longer exists).
-    The background session records the same user-facing name the pane displays, so the
-    name is the only reliable join key. Matched only when exactly one live background
-    session claims that name, so an ambiguous name never rebinds a pane.
+    Last-resort fallback for a pane whose foreground interactive process has no
+    transcript of its own: it is viewing a background session, and nothing on disk
+    links the two once `parkedJobId` goes stale (the job directory it names is often
+    already deleted). Every stronger key was checked and ruled out: the viewer's argv
+    carries no `attach <id>`, the two processes sit on different TTYs with no socket
+    between them, and the viewer's `claude daemon run --spawned-by` shares exactly one
+    socket with *every* live background session, so it cannot tell them apart.
+
+    That leaves the name, which is weak on two counts, and callers should treat a match
+    as a guess rather than an identity:
+      - It is mutable. `/rename`, an auto-generated summary, or a manual
+        `herdr pane rename` all rewrite it, and the link breaks or moves with it.
+      - It is partly self-referential: sync_pane() writes pane labels via
+        `pane.rename`, so a label can be an echo of an earlier sync rather than
+        independent evidence.
+
+    Narrowed so a wrong guess stays unlikely: the name must be reported by the session
+    itself or set by the user (never derived from a directory), the process must still
+    be alive, its transcript must exist, and exactly one live session may claim the
+    name. Anything ambiguous returns nothing and leaves the pane unbound -- a failed
+    resume the user can fix by hand beats silently attaching a pane to someone else's
+    conversation.
     """
     name = (name or "").strip()
     if not name:
@@ -432,9 +448,13 @@ def resolve_session_from_pid(pid: int, pane_name: str = "") -> tuple[str | None,
         # because it is displaying a background session. Report that session instead,
         # otherwise Herdr persists a UUID `claude --resume` can never find.
         if not is_valid_cc_session(session_id):
+            # jobs/<id>/state.json is the trustworthy link -- it joins on a job id, not
+            # on a mutable name.
             job_sid, job_title = resolve_parked_job_session(data.get("parkedJobId"))
             if job_sid:
                 return job_sid, job_title
+            # Weak fallback once parkedJobId is stale; see the docstring for why the
+            # name is the only key left and how narrow the match has to be.
             bg_sid, bg_title = resolve_live_bg_session_by_name(pane_name)
             if bg_sid:
                 return bg_sid, bg_title
