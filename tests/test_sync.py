@@ -1,5 +1,6 @@
 import unittest
 import sys
+import json
 from pathlib import Path
 
 # Add src to path
@@ -364,6 +365,84 @@ class TestSyncTitle(unittest.TestCase):
             sync_pane(mock_pane, mock_state)
             report_calls = [c for c in rpc_calls if c[0] == "pane.report_agent_session"]
             self.assertEqual(len(report_calls), 0, "unwritten session must not be reported to Herdr")
+
+
+    def test_viewer_pid_resolves_to_parked_job_session(self):
+        """An interactive process with no transcript is a viewer; report the background
+        job's durable session (state.json resumeSessionId), not its own dead UUID."""
+        from unittest.mock import patch
+        import io
+        from sync import resolve_session_from_pid
+
+        viewer = json.dumps({"pid": 111, "kind": "interactive",
+                             "sessionId": "dead0000-0000-0000-0000-000000000000",
+                             "parkedJobId": "job1234"})
+        job = json.dumps({"resumeSessionId": "aaaa1111-1111-1111-1111-111111111111",
+                          "name": "周会文档", "nameSource": "user"})
+
+        def fake_open(path, *a, **k):
+            return io.StringIO(job if "/jobs/" in str(path) else viewer)
+
+        with patch("sync.os.path.isfile", return_value=True), \
+             patch("builtins.open", side_effect=fake_open), \
+             patch("sync.is_valid_cc_session", side_effect=lambda s: s.startswith(("aaaa","bbbb"))), \
+             patch("sync.extract_cc_session_name", return_value=None):
+            sid, title = resolve_session_from_pid(111)
+            self.assertEqual(sid, "aaaa1111-1111-1111-1111-111111111111")
+            self.assertEqual(title, "周会文档")
+
+    def test_viewer_pid_falls_back_to_live_bg_session_by_name(self):
+        """When parkedJobId is a dead pointer, join the pane's displayed name to the
+        live background session that reported the same name."""
+        from unittest.mock import patch, mock_open
+        from sync import resolve_session_from_pid
+
+        viewer = json.dumps({"pid": 222, "kind": "interactive",
+                             "sessionId": "dead0000-0000-0000-0000-000000000000",
+                             "parkedJobId": "gone"})
+        with patch("sync.os.path.isfile", side_effect=lambda p: "jobs" not in str(p)), \
+             patch("builtins.open", mock_open(read_data=viewer)), \
+             patch("sync.is_valid_cc_session", side_effect=lambda s: s.startswith(("aaaa","bbbb"))), \
+             patch("sync.resolve_live_bg_session_by_name",
+                   return_value=("bbbb2222-2222-2222-2222-222222222222", "周会文档")):
+            sid, title = resolve_session_from_pid(222, "周会文档")
+            self.assertEqual(sid, "bbbb2222-2222-2222-2222-222222222222")
+
+    def test_bg_name_match_requires_unique_live_session(self):
+        """An ambiguous name must never rebind a pane; a dead pid must not match."""
+        from unittest.mock import patch, mock_open
+        from sync import resolve_live_bg_session_by_name
+
+        two = json.dumps({"kind": "bg", "pid": 900, "name": "dup", "nameSource": "peer",
+                          "sessionId": "aaaa1111-1111-1111-1111-111111111111"})
+        with patch("sync.glob.glob", return_value=["/s/1.json", "/s/2.json"]), \
+             patch("builtins.open", mock_open(read_data=two)), \
+             patch("sync._pid_alive", return_value=True), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value="dup"):
+            self.assertEqual(resolve_live_bg_session_by_name("dup"), (None, None))
+
+        with patch("sync.glob.glob", return_value=["/s/1.json"]), \
+             patch("builtins.open", mock_open(read_data=two)), \
+             patch("sync._pid_alive", return_value=False), \
+             patch("sync.is_valid_cc_session", return_value=True):
+            self.assertEqual(resolve_live_bg_session_by_name("dup"), (None, None))
+
+        self.assertEqual(resolve_live_bg_session_by_name(""), (None, None))
+
+    def test_bg_name_match_rejects_derived_name(self):
+        """A directory-derived name is not an identity and must not be used to join."""
+        from unittest.mock import patch, mock_open
+        from sync import resolve_live_bg_session_by_name
+
+        derived = json.dumps({"kind": "bg", "pid": 901, "name": "bytedance-d1",
+                              "nameSource": "derived",
+                              "sessionId": "bbbb1111-1111-1111-1111-111111111111"})
+        with patch("sync.glob.glob", return_value=["/s/1.json"]), \
+             patch("builtins.open", mock_open(read_data=derived)), \
+             patch("sync._pid_alive", return_value=True), \
+             patch("sync.is_valid_cc_session", return_value=True):
+            self.assertEqual(resolve_live_bg_session_by_name("bytedance-d1"), (None, None))
 
 
 if __name__ == "__main__":

@@ -315,7 +315,101 @@ def is_valid_cc_session(session_id: str) -> bool:
     return False
 
 
-def resolve_session_from_pid(pid: int) -> tuple[str | None, str | None]:
+def _pid_alive(pid: int) -> bool:
+    """Whether a process is still running (signal 0 probe, no side effects)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def resolve_parked_job_session(job_id: str) -> tuple[str | None, str | None]:
+    """Resolves the durable session behind a parked background job.
+
+    An interactive process that attached to a background job is a thin viewer: it owns
+    the pane's TTY but never writes a transcript. The conversation lives in the job it
+    attached to, recorded in ~/.claude/jobs/<jobId>/state.json, whose `resumeSessionId`
+    is what `claude --resume` can actually reopen.
+    """
+    if not job_id or not isinstance(job_id, str):
+        return None, None
+    if not re.match(r"^[0-9a-zA-Z_-]{1,64}$", job_id):
+        return None, None
+    state_file = os.path.expanduser(f"~/.claude/jobs/{job_id}/state.json")
+    if not os.path.isfile(state_file):
+        return None, None
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None
+
+    for key in ("resumeSessionId", "sessionId"):
+        sid = data.get(key)
+        if not isinstance(sid, str):
+            continue
+        sid = sid.strip()
+        if not re.match(r"^[0-9a-fA-F-]{6,36}$", sid):
+            continue
+        if not is_valid_cc_session(sid):
+            continue
+        title = extract_cc_session_name(sid)
+        if not title:
+            raw_name = data.get("name")
+            if isinstance(raw_name, str) and raw_name and data.get("nameSource") != "derived":
+                title = sanitize_title(raw_name)[:32]
+        return sid, title
+    return None, None
+
+
+def resolve_live_bg_session_by_name(name: str) -> tuple[str | None, str | None]:
+    """Finds the live background session whose peer-assigned name matches `name`.
+
+    Used when a pane's foreground interactive process has no transcript of its own: it
+    is viewing a background session, and `~/.claude/sessions/<pid>.json` carries no
+    usable link to it (`parkedJobId` frequently points at a job that no longer exists).
+    The background session records the same user-facing name the pane displays, so the
+    name is the only reliable join key. Matched only when exactly one live background
+    session claims that name, so an ambiguous name never rebinds a pane.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None, None
+
+    matches = []
+    for path in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if data.get("kind") != "bg":
+            continue
+        # A name Claude derived from the directory is not an identity; only trust a
+        # name the session itself reported (peer) or the user set.
+        if data.get("nameSource") == "derived":
+            continue
+        if (data.get("name") or "").strip() != name:
+            continue
+        pid = data.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or not _pid_alive(pid):
+            continue
+        sid = data.get("sessionId")
+        if not isinstance(sid, str):
+            continue
+        sid = sid.strip()
+        if not re.match(r"^[0-9a-fA-F-]{6,36}$", sid) or not is_valid_cc_session(sid):
+            continue
+        matches.append(sid)
+
+    if len(matches) != 1:
+        return None, None
+    sid = matches[0]
+    return sid, extract_cc_session_name(sid) or sanitize_title(name)[:32]
+
+
+def resolve_session_from_pid(pid: int, pane_name: str = "") -> tuple[str | None, str | None]:
     """Reads ~/.claude/sessions/{pid}.json to extract authoritative Root Session ID and title."""
     if not pid or not isinstance(pid, int) or pid <= 0:
         return None, None
@@ -334,6 +428,17 @@ def resolve_session_from_pid(pid: int) -> tuple[str | None, str | None]:
         if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
             return None, None
 
+        # Viewer process: this interactive session writes no transcript of its own
+        # because it is displaying a background session. Report that session instead,
+        # otherwise Herdr persists a UUID `claude --resume` can never find.
+        if not is_valid_cc_session(session_id):
+            job_sid, job_title = resolve_parked_job_session(data.get("parkedJobId"))
+            if job_sid:
+                return job_sid, job_title
+            bg_sid, bg_title = resolve_live_bg_session_by_name(pane_name)
+            if bg_sid:
+                return bg_sid, bg_title
+
         title = extract_cc_session_name(session_id)
         if not title:
             name_source = data.get("nameSource")
@@ -347,7 +452,7 @@ def resolve_session_from_pid(pid: int) -> tuple[str | None, str | None]:
     return None, None
 
 
-def resolve_title_from_foreground_process(pane_id: str, cwd: str = "") -> tuple[str | None, str | None]:
+def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name: str = "") -> tuple[str | None, str | None]:
     """Inspects pane.process_info to resolve session_id and title directly from PID or CLI args (attach/--resume/--name)."""
     try:
         pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
@@ -374,7 +479,7 @@ def resolve_title_from_foreground_process(pane_id: str, cwd: str = "") -> tuple[
             # 1. Authoritative check via process PID -> ~/.claude/sessions/{pid}.json
             proc_pid = proc.get("pid")
             if isinstance(proc_pid, int):
-                sid, title = resolve_session_from_pid(proc_pid)
+                sid, title = resolve_session_from_pid(proc_pid, pane_name)
                 if sid:
                     return sid, title
 
@@ -463,7 +568,7 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     # Priority 2: Direct foreground process inspection (PID -> sessions/{pid}.json or CLI args)
     # Physically immune to stale Herdr state or background subagent hijacking
     if not target_title:
-        fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd)
+        fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd, current_title or current_label)
         if fg_sid:
             # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
             # report the authoritative session back to Herdr with monotonic sequence and resume source.
