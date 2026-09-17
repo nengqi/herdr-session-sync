@@ -417,14 +417,14 @@ class TestSyncTitle(unittest.TestCase):
                           "sessionId": "aaaa1111-1111-1111-1111-111111111111"})
         with patch("sync.glob.glob", return_value=["/s/1.json", "/s/2.json"]), \
              patch("builtins.open", mock_open(read_data=two)), \
-             patch("sync._pid_alive", return_value=True), \
+             patch("sync._is_live_claude_process", return_value=True), \
              patch("sync.is_valid_cc_session", return_value=True), \
              patch("sync.extract_cc_session_name", return_value="dup"):
             self.assertEqual(resolve_live_bg_session_by_name("dup"), (None, None))
 
         with patch("sync.glob.glob", return_value=["/s/1.json"]), \
              patch("builtins.open", mock_open(read_data=two)), \
-             patch("sync._pid_alive", return_value=False), \
+             patch("sync._is_live_claude_process", return_value=False), \
              patch("sync.is_valid_cc_session", return_value=True):
             self.assertEqual(resolve_live_bg_session_by_name("dup"), (None, None))
 
@@ -440,9 +440,62 @@ class TestSyncTitle(unittest.TestCase):
                               "sessionId": "bbbb1111-1111-1111-1111-111111111111"})
         with patch("sync.glob.glob", return_value=["/s/1.json"]), \
              patch("builtins.open", mock_open(read_data=derived)), \
-             patch("sync._pid_alive", return_value=True), \
+             patch("sync._is_live_claude_process", return_value=True), \
              patch("sync.is_valid_cc_session", return_value=True):
             self.assertEqual(resolve_live_bg_session_by_name("bytedance-d1"), (None, None))
+
+
+    def test_fresh_unwritten_session_is_not_rebound_by_name(self):
+        """A session nobody has typed into yet has no transcript, but it is not a viewer.
+        Without a parkedJobId it must keep its own id -- never adopt a background session
+        that merely shares the pane title."""
+        from unittest.mock import patch, mock_open
+        from sync import resolve_session_from_pid
+
+        fresh = json.dumps({"pid": 333, "kind": "interactive",
+                            "sessionId": "cccc3333-3333-3333-3333-333333333333",
+                            "name": "周会文档", "nameSource": "peer"})
+        with patch("sync.os.path.isfile", return_value=True), \
+             patch("builtins.open", mock_open(read_data=fresh)), \
+             patch("sync.is_valid_cc_session", return_value=False), \
+             patch("sync.extract_cc_session_name", return_value=None), \
+             patch("sync.resolve_live_bg_session_by_name") as mock_name, \
+             patch("sync.resolve_parked_job_session") as mock_job:
+            sid, _ = resolve_session_from_pid(333, "周会文档")
+            self.assertEqual(sid, "cccc3333-3333-3333-3333-333333333333")
+            mock_name.assert_not_called()
+            mock_job.assert_not_called()
+
+    def test_is_live_claude_process_rejects_impostors(self):
+        """signal 0 only proves a pid is taken; identity needs the command and procStart."""
+        from unittest.mock import patch
+        from sync import _is_live_claude_process, _proc_start_matches
+
+        self.assertFalse(_is_live_claude_process(None))
+        self.assertFalse(_is_live_claude_process(-1))
+        self.assertFalse(_is_live_claude_process(0))
+
+        ps = "SNs+ Wed Sep 16 13:28:43 2026 claude bg-spare --bg-spare /tmp/x.sock"
+        zombie = "Z+ Wed Sep 16 13:28:43 2026 claude bg-spare --bg-spare x"
+        other = "SNs+ Wed Sep 16 13:28:43 2026 /usr/bin/python3 unrelated.py"
+
+        class R:
+            def __init__(self, out): self.returncode, self.stdout = 0, out
+
+        with patch("sync.os.kill", return_value=None):
+            with patch("subprocess.run", return_value=R(ps)):
+                self.assertTrue(_is_live_claude_process(1, "Wed Sep 16 13:28:43 2026"))
+                # A procStart from a different instant means the pid was recycled.
+                self.assertFalse(_is_live_claude_process(1, "Mon Jan  1 00:00:00 2020"))
+            with patch("subprocess.run", return_value=R(zombie)):
+                self.assertFalse(_is_live_claude_process(1))
+            with patch("subprocess.run", return_value=R(other)):
+                self.assertFalse(_is_live_claude_process(1))
+
+        # ps prints local time while procStart records UTC; the same instant must match.
+        self.assertTrue(_proc_start_matches("Wed Sep 16 13:28:43 2026", "Wed Sep 16 13:28:43 2026"))
+        self.assertFalse(_proc_start_matches("Wed Sep 16 13:28:43 2026", "not a date"))
+        self.assertFalse(_proc_start_matches("", "Wed Sep 16 13:28:43 2026"))
 
 
 if __name__ == "__main__":

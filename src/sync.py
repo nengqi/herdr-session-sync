@@ -12,6 +12,7 @@ Zero dependencies (Python standard library only).
 from __future__ import annotations
 
 import argparse
+import calendar
 import glob
 import json
 import os
@@ -315,12 +316,65 @@ def is_valid_cc_session(session_id: str) -> bool:
     return False
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether a process is still running (signal 0 probe, no side effects)."""
+def _proc_start_matches(lstart: str, proc_start: str) -> bool:
+    """Whether `ps -o lstart=` and a session's `procStart` describe the same instant.
+
+    Both use ctime formatting ("Wed Sep 16 13:28:43 2026") but not the same clock: `ps`
+    prints local time while session JSON records UTC, so the strings differ by the UTC
+    offset on the same process. Compare parsed instants under both readings and allow a
+    second of slack, rather than comparing text.
+    """
+    fmt = "%a %b %d %H:%M:%S %Y"
+    try:
+        a = time.strptime(" ".join(lstart.split()), fmt)
+        b = time.strptime(" ".join(proc_start.split()), fmt)
+    except (ValueError, AttributeError):
+        return False
+    try:
+        local = time.mktime(a)
+        return abs(local - time.mktime(b)) <= 1 or abs(local - calendar.timegm(b)) <= 1
+    except (OverflowError, ValueError):
+        return False
+
+
+def _is_live_claude_process(pid: int, proc_start: str | None = None) -> bool:
+    """Whether `pid` is still the Claude process the session metadata describes.
+
+    A signal-0 probe alone only proves *something* holds that pid. Session JSON outlives
+    the process that wrote it, so after a pid rollover an unrelated process can make a
+    long-dead session look alive. Confirm the command is Claude and, when the metadata
+    recorded a `procStart`, that the process started at that instant; also reject a
+    zombie, which answers signal 0 but runs nothing.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
-        return True
     except (OSError, TypeError):
+        return False
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state=,lstart=,command="],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return False
+        # "SNs+ Wed Sep 16 13:28:43 2026 claude bg-spare ..." -- state, then lstart's
+        # fixed five fields, then the command.
+        fields = out.stdout.strip().split(None, 6)
+        if len(fields) < 7:
+            return False
+        state, lstart, command = fields[0], " ".join(fields[1:6]), fields[6]
+        if state.startswith("Z"):
+            return False
+        if "claude" not in command.lower():
+            return False
+        if proc_start and not _proc_start_matches(lstart, proc_start):
+            return False
+        return True
+    except Exception:
         return False
 
 
@@ -408,8 +462,7 @@ def resolve_live_bg_session_by_name(name: str) -> tuple[str | None, str | None]:
             continue
         if (data.get("name") or "").strip() != name:
             continue
-        pid = data.get("pid")
-        if not isinstance(pid, int) or pid <= 0 or not _pid_alive(pid):
+        if not _is_live_claude_process(data.get("pid"), data.get("procStart")):
             continue
         sid = data.get("sessionId")
         if not isinstance(sid, str):
@@ -444,20 +497,28 @@ def resolve_session_from_pid(pid: int, pane_name: str = "") -> tuple[str | None,
         if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
             return None, None
 
-        # Viewer process: this interactive session writes no transcript of its own
-        # because it is displaying a background session. Report that session instead,
-        # otherwise Herdr persists a UUID `claude --resume` can never find.
-        if not is_valid_cc_session(session_id):
+        # A session with no transcript is either a viewer displaying a background session,
+        # or simply a session nobody has typed into yet. Only the first case may be
+        # redirected: `parkedJobId` is the one marker that distinguishes them. Without it,
+        # report nothing -- a fresh session becomes durable on its first user message, and
+        # guessing by name here would bind the pane to an unrelated conversation that
+        # merely shares its title.
+        parked_job_id = data.get("parkedJobId")
+        if not is_valid_cc_session(session_id) and parked_job_id:
             # jobs/<id>/state.json is the trustworthy link -- it joins on a job id, not
             # on a mutable name.
-            job_sid, job_title = resolve_parked_job_session(data.get("parkedJobId"))
+            job_sid, job_title = resolve_parked_job_session(parked_job_id)
             if job_sid:
                 return job_sid, job_title
-            # Weak fallback once parkedJobId is stale; see the docstring for why the
-            # name is the only key left and how narrow the match has to be.
+            # Weak fallback once parkedJobId names a job that no longer exists; see the
+            # docstring for why the name is the only key left and how narrow the match is.
             bg_sid, bg_title = resolve_live_bg_session_by_name(pane_name)
             if bg_sid:
                 return bg_sid, bg_title
+        # Without a parkedJobId this is a plain session nobody has typed into yet, not a
+        # viewer. Return its own id so the pane still gets a label; sync_pane's
+        # is_valid_cc_session() gate keeps the unwritten id from being persisted, and
+        # guessing by name here would bind the pane to an unrelated same-titled session.
 
         title = extract_cc_session_name(session_id)
         if not title:

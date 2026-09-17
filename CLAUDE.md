@@ -22,6 +22,16 @@ pass `is_valid_cc_session()` first. Two situations produce one:
   writes a transcript, while a `kind: bg` process on another TTY holds the real conversation.
   Report the background one (`jobs/<id>/state.json` → `resumeSessionId`).
 
+The two are indistinguishable from a missing transcript alone, so confirm the viewer from
+`~/.claude/sessions/<pid>.json` first: a non-empty `parkedJobId` is the marker. Most live
+interactive sessions do not have one, and redirecting without that check binds a brand-new
+pane to whatever background session happens to share its title.
+
+Do not use a signal-0 probe to decide a background session is alive: session JSON outlives
+its process, so a recycled pid resurrects a dead session. Match the command and `procStart`
+too — and note `procStart` is UTC while `ps -o lstart=` is local time, so compare instants,
+not strings.
+
 Binding the wrong session is worse than binding none: a failed resume is something the user
 fixes by hand, a wrong bind silently attaches a pane to someone else's conversation. When
 unsure, report nothing.
