@@ -497,6 +497,23 @@ class TestSyncTitle(unittest.TestCase):
         self.assertFalse(_proc_start_matches("Wed Sep 16 13:28:43 2026", "not a date"))
         self.assertFalse(_proc_start_matches("", "Wed Sep 16 13:28:43 2026"))
 
+    def test_extract_title_from_screen_reverse_scan_picks_bottom_readline_bar(self):
+        """Must scan bottom-up so tool/markdown dividers are ignored in favor of the active readline bar."""
+        from unittest.mock import patch
+        from sync import extract_title_from_screen
+
+        screen_text = (
+            "────────────────── Step 1: Query DB ──────────────────\n"
+            "some tool output here\n"
+            "───────────────────────────────── Moshi ─\n"
+            "❯\n"
+            "─────────────────────────────────────────\n"
+        )
+        fake_res = {"result": {"read": {"text": screen_text}}}
+        with patch("sync.herdr_rpc", return_value=fake_res):
+            title = extract_title_from_screen("w1:p1")
+            self.assertEqual(title, "Moshi")
+
 
 if __name__ == "__main__":
     unittest.main()

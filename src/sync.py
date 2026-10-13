@@ -605,10 +605,12 @@ def extract_title_from_screen(pane_id: str) -> str | None:
         text = res.get("result", {}).get("read", {}).get("text", "")
         if not text:
             return None
-        for line in text.splitlines():
+        for line in reversed(text.splitlines()):
             m = re.search(r"[─\─\—\-]{3,}\s*(.+?)\s*[─\─\—\-]+$", line)
             if m:
                 candidate = m.group(1).strip()
+                if candidate and set(candidate).issubset({'-', '─', '—'}):
+                    continue
                 ignored_keywords = {
                     "focus", "agents", "options", "recap", "permissions", "shift+tab",
                     "bypass permissions", "auto mode", "plan mode", "manual mode",
