@@ -15,18 +15,22 @@ Auto-sync Claude Code, Codex & Agent session names across Herdr pane labels, PTY
 ## Restart reattach for viewer panes
 A viewer pane is bound to the background session it displays. On restart Herdr types
 `claude --resume <that id>` into the pane's shell. The user's zsh launcher (`ca` in
-`~/.zshrc`, `_claude_bg_resume_args`) rewrites exactly that form to `claude attach <job>`
-whenever `~/.claude/jobs/<job>/state.json` exists, so both a running and an exited background
+`~/.zshrc`, the check lives inside the function body) rewrites exactly that form to `claude attach <job>`
+whenever `${CLAUDE_CONFIG_DIR:-~/.claude}/jobs/<job>/state.json` names it, so both a running and an exited background
 session reopen in place; a plain resume of an exited one would later `/bg` into a
 "name (2)" copy. Where that launcher is not loaded, Claude refuses the resume of a running
 session and prints `Run \`claude attach <job>\``, and the `--reattach` startup hook runs it.
 
 Do not move this to a custom `resume_argv`: Herdr only accepts one from a source holding the
 pane through `pane.report_agent`, and while held it stops reading the screen, so the pane's
-status freezes (checked in a named test session, Herdr 0.9.4). Two more Herdr behaviors the
-hook depends on: a reference switches for a live occupant only when the report carries
-`session_start_source` (otherwise it is acknowledged and ignored), and Herdr drops the
-reference seconds after a refused resume is back at the shell.
+status freezes (checked in a named test session, Herdr 0.9.4). More Herdr behaviors the
+plugin depends on: a reference switches for a live occupant only when the report carries
+`session_start_source` (otherwise it is acknowledged and ignored) — `startup` never replaces
+an existing reference, `resume` does; every report needs a `seq` above the last one accepted
+from that source (use `time.time_ns()`, millisecond values are silently dropped); Herdr
+ignores `pane.release_agent` from official sources, and none of release / clear_agent_authority /
+an empty report cleared a reference on a pane sitting at a shell; and Herdr drops the reference seconds after a refused resume is
+back at the shell.
 
 ## Never persist a session Herdr cannot resume
 Herdr stores a pane's `agent_session_id` in `~/.config/herdr/session.json` and reruns
