@@ -6,9 +6,24 @@ Auto-sync Claude Code, Codex & Agent session names across Herdr pane labels, PTY
 - Pure Python standard library (no external npm/pip dependencies).
 - Herdr plugin manifest at `herdr-plugin.toml`.
 - Run tests: `python3 -m unittest discover -s tests/`
-- This repo is not what Herdr runs. After editing `src/sync.py`, copy it to
-  `~/.config/herdr/local-plugins/session-sync/src/sync.py`, bump the manifest version, and
-  `herdr server reload-config` — the two are separate copies, not a symlink.
+- Herdr links this repo directly (`herdr plugin list` shows `local:<this repo>`), so a saved
+  `src/sync.py` is live on the next event. The manifest is cached in
+  `~/.config/herdr/plugins.json` at link time: after editing `herdr-plugin.toml`, bump the
+  version and run `herdr plugin link <this repo> --enabled`. The old copy under
+  `~/.config/herdr/local-plugins/session-sync/` was never what ran and has been removed.
+
+## Restart reattach for viewer panes
+A viewer pane is bound to the background session it displays. On restart Herdr runs
+`claude --resume <that id>`; Claude refuses while the session still runs in the background
+and prints `Run \`claude attach <job>\``, and the `--reattach` startup hook runs exactly that.
+If the session stopped meanwhile, the resume simply reopens it in the pane.
+
+Do not move this to a custom `resume_argv`: Herdr only accepts one from a source holding the
+pane through `pane.report_agent`, and while held it stops reading the screen, so the pane's
+status freezes (checked in a named test session, Herdr 0.9.4). Two more Herdr behaviors the
+hook depends on: a reference switches for a live occupant only when the report carries
+`session_start_source` (otherwise it is acknowledged and ignored), and Herdr drops the
+reference seconds after a refused resume is back at the shell.
 
 ## Never persist a session Herdr cannot resume
 Herdr stores a pane's `agent_session_id` in `~/.config/herdr/session.json` and reruns
