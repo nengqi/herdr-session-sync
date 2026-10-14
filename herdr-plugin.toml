@@ -1,6 +1,6 @@
 id = "session-sync"
 name = "Session Sync"
-version = "0.1.10"
+version = "0.1.15"
 min_herdr_version = "0.7.5"
 description = "Auto-sync Claude Code, Codex, and Agent session names across Herdr pane labels, PTY window titles, and mobile companion apps (Heeler)"
 platforms = ["linux", "macos"]
@@ -36,3 +36,6 @@ command = ["python3", "src/sync.py", "--event"]
 
 [[startup]]
 command = ["python3", "src/sync.py", "--all"]
+
+[[startup]]
+command = ["python3", "src/sync.py", "--reattach"]
