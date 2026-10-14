@@ -1,9 +1,16 @@
 id = "session-sync"
 name = "Session Sync"
-version = "0.1.16"
+version = "0.1.17"
 min_herdr_version = "0.7.5"
 description = "Auto-sync Claude Code, Codex, and Agent session names across Herdr pane labels, PTY window titles, and mobile companion apps (Heeler)"
 platforms = ["linux", "macos"]
+
+[[actions]]
+id = "bits-auto-advance"
+title = "Bits: Auto-advance release pipeline gates"
+description = "Scan active Bits release pipeline and auto-continue waiting/interactive approval gates"
+contexts = ["global", "workspace", "pane"]
+command = ["bytedcli", "bits", "release", "pipeline", "continue-waiting", "--yes"]
 
 [[actions]]
 id = "sync-all"
