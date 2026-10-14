@@ -56,3 +56,13 @@ unsure, report nothing.
 
 `resolve_live_bg_session_by_name` is the one weak link — see its docstring for why the name
 is a guess and which stronger keys were already ruled out.
+
+## Herdr's Claude hook stays Herdr's
+`~/.claude/hooks/herdr-agent-state.sh` is Herdr's file (`herdr integration status` reads
+`current`), so Herdr keeps it up to date. herdrdev/herdr#5261 (a background session inherits
+the daemon's `HERDR_PANE_ID` and binds an unrelated pane) is covered by one line laid over
+it: `[ -z "${CLAUDE_JOB_DIR:-}" ] || exit 0` after the shipped `HERDR_PANE_ID` check.
+`ensure_hook_guard` adds it at startup and on every event, skips a file that already checks
+`CLAUDE_JOB_DIR`, and leaves the file alone if the anchor line moved. Do not fork the hook
+again; `~/Desktop/now/herdr-upstream/run_20261014/repro.sh --overlay` checks the whole setup
+in isolation (prints FIXED).
