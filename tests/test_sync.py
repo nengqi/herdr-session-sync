@@ -516,6 +516,58 @@ class TestSyncTitle(unittest.TestCase):
             mock_name.assert_not_called()
             mock_job.assert_not_called()
 
+    def test_unresolved_viewer_preserves_existing_binding(self):
+        from unittest.mock import patch, mock_open, MagicMock
+        from sync import resolve_session_from_pid, resolve_title_from_foreground_process, sync_pane, StateManager
+
+        viewer_sid = "dead0000-0000-0000-0000-000000000000"
+        bound_sid = "aaaa1111-1111-1111-1111-111111111111"
+        pane = {"pane_id": "w1:p1", "label": "Viewed Task", "title": "Viewed Task",
+                "agent_session": {"value": bound_sid}}
+        process = {"pid": 222, "argv0": "claude", "argv": ["claude", "--resume", viewer_sid]}
+        viewer = {"kind": "interactive", "sessionId": viewer_sid, "parkedJobId": "gone"}
+
+        def fake_rpc(method, params=None, timeout=1.5):
+            if method == "pane.process_info":
+                return {"result": {"process_info": {"foreground_processes": [process]}}}
+            return {"result": {"ok": True}}
+
+        for title in ("Viewer Title", None):
+            with self.subTest(title=title), \
+                 patch("sync.os.path.isfile", return_value=True), \
+                 patch("builtins.open", mock_open(read_data=json.dumps(viewer))), \
+                 patch("sync.resolve_parked_job_session", return_value=(None, None)), \
+                 patch("sync.resolve_live_bg_session_by_name", return_value=(None, None)), \
+                 patch("sync.extract_cc_session_name", return_value=title), \
+                 patch("sync.glob.glob", return_value=[f"/projects/task/{viewer_sid}.jsonl"]), \
+                 patch("sync.os.path.getmtime", return_value=1), \
+                 patch("sync.is_valid_cc_session", return_value=True), \
+                 patch("sync.herdr_rpc", side_effect=fake_rpc) as mock_rpc:
+                self.assertEqual(resolve_session_from_pid(222, "Viewed Task"), (None, title))
+                self.assertEqual(resolve_title_from_foreground_process("w1:p1"), (None, title))
+                sync_pane(pane, MagicMock(spec=StateManager))
+                reports = [call for call in mock_rpc.call_args_list
+                           if call.args[0] == "pane.report_agent_session"]
+                self.assertEqual(reports, [])
+
+    def test_attach_argv_resolves_without_session_metadata(self):
+        from unittest.mock import patch
+        from sync import resolve_title_from_foreground_process
+
+        session_id = "aaaa1111-1111-1111-1111-111111111111"
+        transcript = f"/projects/task/{session_id}.jsonl"
+        process = {"pid": 222, "argv0": "claude",
+                   "argv": ["claude", "--dangerously-skip-permissions", "attach", session_id]}
+        with patch("sync.herdr_rpc", return_value={
+                "result": {"process_info": {"foreground_processes": [process]}}}), \
+             patch("sync.os.path.isfile", side_effect=lambda path: str(path) == transcript), \
+             patch("sync.glob.glob", return_value=[transcript]), \
+             patch("sync.os.path.getmtime", return_value=1), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value="Attached Task"):
+            self.assertEqual(resolve_title_from_foreground_process("w1:p1"),
+                             (session_id, "Attached Task"))
+
     def test_find_bg_resume_refusal(self):
         """Herdr's restart reruns `claude --resume <id>`; for a session still running in
         the background Claude refuses and names the job to attach. Only that exact,
@@ -546,6 +598,35 @@ class TestSyncTitle(unittest.TestCase):
         self.assertIsNone(find_bg_resume_refusal(screen.replace("(3eae96f6)", "(3eae;rm)"), sid))
         self.assertIsNone(find_bg_resume_refusal("", sid))
 
+    def test_find_bg_resume_refusal_narrow_terminals(self):
+        from sync import find_bg_resume_refusal
+
+        session_id = "3eae96f6-42f7-4349-8bc1-111e0b6f04e5"
+        message = ("That session is running in the background (3eae96f6). Run `claude attach 3eae96f6`"
+                   " to open it, or `claude stop 3eae96f6` first to resume it here. Add --fork-session"
+                   " to branch off a copy instead.")
+        for width in (60, 40):
+            with self.subTest(width=width):
+                lines = [message[offset:offset + width] for offset in range(0, len(message), width)]
+                self.assertGreater(len(lines), 3)
+                screen = f" ~/w claude --resume {session_id}\n" + "\n".join(lines) + "\n ~/w\n"
+                self.assertEqual(find_bg_resume_refusal(screen, session_id), "3eae96f6")
+                self.assertIsNone(find_bg_resume_refusal(screen + " ~/w ls\nfiles\n ~/w\n", session_id))
+                self.assertIsNone(find_bg_resume_refusal(screen.replace("--resume", "--continue"), session_id))
+
+        # Claude wraps on word boundaries and drops the space at the break.
+        word_wrapped = (f" ~/w claude --resume {session_id}\nThat session is running in the\n"
+                        "background (3eae96f6). Run `claude attach 3eae96f6` to open it.\n ~/w\n")
+        self.assertEqual(find_bg_resume_refusal(word_wrapped, session_id), "3eae96f6")
+
+        for line_count in (8, 9):
+            with self.subTest(line_count=line_count):
+                lines = ["That session is running in the background (3eae96f6)"]
+                lines += ["continued"] * (line_count - 2) + ["ends here."]
+                screen = f" ~/w claude --resume {session_id}\n" + "\n".join(lines) + "\n ~/w\n"
+                self.assertEqual(find_bg_resume_refusal(screen, session_id),
+                                 "3eae96f6" if line_count == 8 else None)
+
     def test_reattach_viewers_after_restore(self):
         """Attach once per pane whose restart resume Claude refused; leave panes running
         Claude, and panes without a Claude session reference, alone."""
@@ -561,14 +642,15 @@ class TestSyncTitle(unittest.TestCase):
         panes = [{"pane_id": "w1:pA", "agent_session": ref(sid)},
                  {"pane_id": "w1:pB", "agent_session": ref("bbbb0000-0000-0000-0000-000000000000")},
                  {"pane_id": "w1:pC"}]
-        fg = {"w1:pA": [{"argv": ["-zsh"], "argv0": "-zsh", "name": "zsh"}],
+        fg = {"w1:pA": [{"pid": 100, "argv": ["-zsh"], "argv0": "-zsh", "name": "zsh"}],
               "w1:pB": [{"argv": ["claude", "--resume", "bbbb"], "argv0": "claude", "name": "2.1"}]}
 
         def fake_rpc(method, params=None, timeout=1.5):
             if method == "pane.list":
                 return {"result": {"panes": panes}}
             if method == "pane.process_info":
-                return {"result": {"process_info": {"foreground_processes": fg[params["pane_id"]]}}}
+                return {"result": {"process_info": {"shell_pid": 100,
+                                                    "foreground_processes": fg[params["pane_id"]]}}}
             if method == "pane.read":
                 # Herdr's JSON API spells this enum with underscores (the CLI uses dashes).
                 if params.get("source") not in {"visible", "recent", "recent_unwrapped", "detection"}:
@@ -597,12 +679,184 @@ class TestSyncTitle(unittest.TestCase):
         with patch("sync.herdr_rpc", side_effect=fake_rpc_dropping), \
              patch("subprocess.run") as mock_run, \
              patch.dict("os.environ", {"HERDR_BIN_PATH": "/x/herdr"}):
+            mock_run.return_value.returncode = 0
             attached = reattach_viewers_after_restore(
                 timeout=60, interval=0, settle=20, sleep=lambda s: None, clock=lambda: next(ticks))
         self.assertEqual(attached, [("w1:pA", "3eae96f6")])
         self.assertEqual(mock_run.call_count, 1)
         self.assertEqual(mock_run.call_args[0][0],
                          ["/x/herdr", "pane", "run", "w1:pA", "claude attach 3eae96f6"])
+
+    def test_reattach_only_types_into_idle_shell(self):
+        from unittest.mock import patch, Mock
+        from sync import reattach_viewers_after_restore
+
+        session_id = "3eae96f6-42f7-4349-8bc1-111e0b6f04e5"
+        pane = {"pane_id": "w1:p1", "agent_session": {"agent": "claude", "kind": "id", "value": session_id}}
+        refusal = (f"claude --resume {session_id}\n"
+                   "That session is running in the background (3eae96f6).\n ~/w\n")
+        shell = {"pid": 100, "argv": ["-zsh"], "name": "zsh"}
+        reader = {"pid": 200, "argv": ["cat"], "name": "cat"}
+        cases = [
+            (None, False),
+            ({"error": {"code": "unavailable"}}, False),
+            ({"result": {}}, False),
+            ({"result": {"process_info": None}}, False),
+            ({"result": {"process_info": {"shell_pid": 100}}}, False),
+            ({"result": {"process_info": {"shell_pid": 100, "foreground_processes": []}}}, False),
+            ({"result": {"process_info": {"foreground_processes": [shell]}}}, False),
+            ({"result": {"process_info": {"shell_pid": 100, "foreground_processes": [{}]}}}, False),
+        ]
+        for foreground, idle in (([reader], False), ([shell, reader], False),
+                                 ([dict(shell, pid=200)], False), ([shell], True), ([shell, shell], True)):
+            cases.append(({"result": {"process_info": {"shell_pid": 100,
+                                                      "foreground_processes": foreground}}}, idle))
+
+        for process_info, idle in cases:
+            with self.subTest(process_info=process_info):
+                now = [0.0]
+
+                def fake_sleep(seconds):
+                    now[0] += seconds
+
+                def fake_rpc(method, params=None, timeout=1.5):
+                    if method == "pane.list":
+                        return {"result": {"panes": [pane]}}
+                    if method == "pane.process_info":
+                        return process_info
+                    if method == "pane.read":
+                        return {"result": {"read": {"text": refusal}}}
+                    return None
+
+                with patch("sync.herdr_rpc", side_effect=fake_rpc), \
+                     patch("subprocess.run", return_value=Mock(returncode=0)) as mock_run:
+                    attached = reattach_viewers_after_restore(
+                        timeout=3, interval=1, settle=0, sleep=fake_sleep, clock=lambda: now[0])
+                self.assertEqual(attached, [("w1:p1", "3eae96f6")] if idle else [])
+                self.assertEqual(mock_run.call_count, int(idle))
+
+    def test_reattach_waits_for_claude_to_stabilize(self):
+        from unittest.mock import patch, Mock
+        from sync import reattach_viewers_after_restore
+
+        session_id = "3eae96f6-42f7-4349-8bc1-111e0b6f04e5"
+        pane = {"pane_id": "w1:p1", "agent_session": {"agent": "claude", "kind": "id", "value": session_id}}
+        refusal = (f"claude --resume {session_id}\n"
+                   "That session is running in the background (3eae96f6).\n ~/w\n")
+        for scenario, finished_at in (("late_refusal", 24), ("stable", 25), ("interrupted", 38)):
+            with self.subTest(scenario=scenario):
+                now = [0.0]
+
+                def fake_sleep(seconds):
+                    now[0] += seconds
+
+                def fake_rpc(method, params=None, timeout=1.5):
+                    if method == "pane.list":
+                        return {"result": {"panes": [pane]}}
+                    if method == "pane.process_info":
+                        if scenario == "interrupted" and now[0] == 22:
+                            return None
+                        running = now[0] >= 10 and not (scenario == "late_refusal" and now[0] >= 24)
+                        process = {"pid": 200, "argv": ["claude"]} if running else {"pid": 100, "argv": ["zsh"]}
+                        return {"result": {"process_info": {"shell_pid": 100, "foreground_processes": [process]}}}
+                    if method == "pane.read":
+                        text = refusal if scenario == "late_refusal" and now[0] >= 24 else " ~/w\n"
+                        return {"result": {"read": {"text": text}}}
+                    return None
+
+                with patch("sync.herdr_rpc", side_effect=fake_rpc), \
+                     patch("subprocess.run", return_value=Mock(returncode=0)) as mock_run:
+                    attached = reattach_viewers_after_restore(
+                        timeout=60, interval=1, settle=20, sleep=fake_sleep, clock=lambda: now[0])
+                self.assertEqual(now[0], finished_at)
+                self.assertEqual(attached, [("w1:p1", "3eae96f6")] if scenario == "late_refusal" else [])
+                self.assertEqual(mock_run.call_count, int(scenario == "late_refusal"))
+
+    def test_reattach_retries_failed_command(self):
+        import subprocess
+        from unittest.mock import patch, Mock
+        from sync import reattach_viewers_after_restore
+
+        session_id = "3eae96f6-42f7-4349-8bc1-111e0b6f04e5"
+        pane = {"pane_id": "w1:p1", "agent_session": {"agent": "claude", "kind": "id", "value": session_id}}
+        refusal = (f"claude --resume {session_id}\n"
+                   "That session is running in the background (3eae96f6).\n ~/w\n")
+
+        def fake_rpc(method, params=None, timeout=1.5):
+            if method == "pane.list":
+                return {"result": {"panes": [pane]}}
+            if method == "pane.process_info":
+                return {"result": {"process_info": {"shell_pid": 100, "foreground_processes": [{"pid": 100}]}}}
+            if method == "pane.read":
+                return {"result": {"read": {"text": refusal}}}
+            return None
+
+        for failure in (Mock(returncode=1), OSError("unavailable"), subprocess.TimeoutExpired("herdr", 5), None):
+            with self.subTest(failure=failure):
+                now = [0.0]
+
+                def fake_sleep(seconds):
+                    now[0] += seconds
+
+                outcomes = [failure, Mock(returncode=0)] if failure is not None else [Mock(returncode=1)] * 4
+                with patch("sync.herdr_rpc", side_effect=fake_rpc), \
+                     patch("subprocess.run", side_effect=outcomes) as mock_run:
+                    attached = reattach_viewers_after_restore(
+                        timeout=3, interval=1, settle=0, sleep=fake_sleep, clock=lambda: now[0])
+                self.assertEqual(attached, [("w1:p1", "3eae96f6")] if failure is not None else [])
+                self.assertEqual(mock_run.call_count, 2 if failure is not None else 4)
+                self.assertEqual(now[0], 1 if failure is not None else 3)
+
+    def test_claude_config_dir_defaults_and_override(self):
+        from unittest.mock import patch
+        from sync import claude_config_dir, default_claude_hook_path
+
+        for environment, expected in (({}, Path("/home/testuser/.claude")),
+                                      ({"CLAUDE_CONFIG_DIR": ""}, Path("/home/testuser/.claude")),
+                                      ({"CLAUDE_CONFIG_DIR": "/custom/config"}, Path("/custom/config"))):
+            with self.subTest(environment=environment), \
+                 patch.dict("os.environ", environment, clear=True), \
+                 patch("sync.Path.home", return_value=Path("/home/testuser")):
+                self.assertEqual(claude_config_dir(), expected)
+                self.assertEqual(default_claude_hook_path(), expected / "hooks" / "herdr-agent-state.sh")
+
+    def test_session_data_uses_claude_config_dir(self):
+        import fnmatch
+        import io
+        from unittest.mock import patch
+        from sync import (is_valid_cc_session, resolve_session_from_pid, resolve_parked_job_session,
+                          resolve_live_bg_session_by_name, resolve_title_from_foreground_process)
+
+        base = "/custom/config"
+        job_sid = "aaaa1111-1111-1111-1111-111111111111"
+        bg_sid = "bbbb2222-2222-2222-2222-222222222222"
+        files = {
+            f"{base}/projects/task/{job_sid}.jsonl": '{"customTitle": "Old Title"}\n',
+            f"{base}/projects/task/{job_sid}/custom-title.json": '{"customTitle": "Job Title"}',
+            f"{base}/projects/task/{bg_sid}.jsonl": '{"customTitle": "Background Title"}\n',
+            f"{base}/sessions/111.json": json.dumps({"kind": "interactive", "sessionId": bg_sid,
+                                                  "parkedJobId": "aaaa1111"}),
+            f"{base}/sessions/222.json": json.dumps({"kind": "bg", "pid": 222, "name": "Background Title",
+                                                  "nameSource": "user", "sessionId": bg_sid}),
+            f"{base}/jobs/aaaa1111/state.json": json.dumps({"resumeSessionId": job_sid}),
+        }
+        process = {"pid": 333, "argv": ["claude", "attach", bg_sid[:8]]}
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": base}), \
+             patch("sync.glob.glob", side_effect=lambda pattern: [path for path in files if fnmatch.fnmatch(path, pattern)]), \
+             patch("sync.os.path.isfile", side_effect=lambda path: str(path) in files), \
+             patch("sync.os.path.getsize", side_effect=lambda path: len(files[str(path)])), \
+             patch("sync.os.path.getmtime", return_value=1), \
+             patch("builtins.open", side_effect=lambda path, *args, **kwargs: io.StringIO(files[str(path)])), \
+             patch("sync._is_live_claude_process", return_value=True), \
+             patch("sync.herdr_rpc", return_value={
+                 "result": {"process_info": {"foreground_processes": [process]}}}):
+            self.assertTrue(is_valid_cc_session(job_sid))
+            self.assertEqual(extract_cc_session_name(job_sid), "Job Title")
+            self.assertEqual(extract_cc_session_name(bg_sid), "Background Title")
+            self.assertEqual(resolve_parked_job_session("aaaa1111"), (job_sid, "Job Title"))
+            self.assertEqual(resolve_session_from_pid(111), (job_sid, "Job Title"))
+            self.assertEqual(resolve_live_bg_session_by_name("Background Title"), (bg_sid, "Background Title"))
+            self.assertEqual(resolve_title_from_foreground_process("w1:p1"), (bg_sid, "Background Title"))
 
     def test_ensure_hook_guard(self):
         """Herdr owns herdr-agent-state.sh and rewrites it on every integration install, so the
