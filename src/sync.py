@@ -497,14 +497,15 @@ def resolve_session_from_pid(pid: int, pane_name: str = "") -> tuple[str | None,
         if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
             return None, None
 
-        # A session with no transcript is either a viewer displaying a background session,
-        # or simply a session nobody has typed into yet. Only the first case may be
-        # redirected: `parkedJobId` is the one marker that distinguishes them. Without it,
-        # report nothing -- a fresh session becomes durable on its first user message, and
-        # guessing by name here would bind the pane to an unrelated conversation that
-        # merely shares its title.
+        # `parkedJobId` marks a viewer displaying a background session; a session nobody
+        # has typed into yet looks the same from a missing transcript alone, so only the
+        # marker may redirect. Without it, report nothing -- a fresh session becomes durable
+        # on its first user message, and guessing by name here would bind the pane to an
+        # unrelated conversation that merely shares its title. The marker wins even when
+        # the viewer has a transcript of its own: a viewer started as `claude --resume X`
+        # keeps X on disk, but X is the stale pre-park conversation, not what it displays.
         parked_job_id = data.get("parkedJobId")
-        if not is_valid_cc_session(session_id) and parked_job_id:
+        if parked_job_id:
             # jobs/<id>/state.json is the trustworthy link -- it joins on a job id, not
             # on a mutable name.
             job_sid, job_title = resolve_parked_job_session(parked_job_id)
@@ -533,6 +534,19 @@ def resolve_session_from_pid(pid: int, pane_name: str = "") -> tuple[str | None,
     return None, None
 
 
+def _is_claude_proc(proc: dict) -> bool:
+    """Whether a pane foreground process is claude, a node runner for claude, or a shell wrapper invoking claude."""
+    argv = proc.get("argv") or []
+    argv0 = os.path.basename(proc.get("argv0") or (argv[0] if argv else ""))
+    name = proc.get("name", "")
+    return (
+        "claude" in argv0
+        or "claude" in name
+        or (argv0 in {"node", "nodejs", "bun"} and len(argv) > 1 and "claude" in os.path.basename(argv[1]))
+        or (argv0 in {"sh", "bash", "zsh"} and any(os.path.basename(a) == "claude" for a in argv[1:3]))
+    )
+
+
 def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name: str = "") -> tuple[str | None, str | None]:
     """Inspects pane.process_info to resolve session_id and title directly from PID or CLI args (attach/--resume/--name)."""
     try:
@@ -544,17 +558,7 @@ def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name
             argv = proc.get("argv", [])
             if not argv:
                 continue
-            argv0 = os.path.basename(proc.get("argv0") or (argv[0] if argv else ""))
-            name = proc.get("name", "")
-
-            # Require the executable itself to be claude, a node runner for claude, or a shell wrapper invoking claude
-            is_claude = (
-                "claude" in argv0
-                or "claude" in name
-                or (argv0 in {"node", "nodejs", "bun"} and len(argv) > 1 and "claude" in os.path.basename(argv[1]))
-                or (argv0 in {"sh", "bash", "zsh"} and any(os.path.basename(a) == "claude" for a in argv[1:3]))
-            )
-            if not is_claude:
+            if not _is_claude_proc(proc):
                 continue
 
             # 1. Authoritative check via process PID -> ~/.claude/sessions/{pid}.json
@@ -628,6 +632,96 @@ def extract_title_from_screen(pane_id: str) -> str | None:
     return None
 
 
+BG_REFUSAL_RE = re.compile(r"That session is running in the background \(([0-9A-Za-z]{4,32})\)")
+
+
+def find_bg_resume_refusal(text: str, session_id: str) -> str | None:
+    """Returns the job id Claude refused to resume in this pane, if that is the pane's latest output.
+
+    After a Herdr restart the pane reruns `claude --resume <session_id>`. When that
+    session is still running in the background, Claude refuses with
+    "That session is running in the background (<job>). Run `claude attach <job>` ..."
+    and drops back to the shell -- the job id there is Claude's own answer to "what does
+    this pane display". Accept it only when the echoed command right above is the
+    `--resume` of this pane's session and at most the shell prompt follows; anything older
+    is history, and attaching on history would type into whatever runs there now. The id
+    is typed into a shell, so it must be a plain alphanumeric token.
+    """
+    if not text or not session_id:
+        return None
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    for i in range(len(lines) - 1, -1, -1):
+        m = BG_REFUSAL_RE.search(lines[i])
+        if not m:
+            continue
+        if len(lines) - 1 - i > 1 or i == 0:
+            return None
+        if "--resume" not in lines[i - 1] or session_id not in lines[i - 1]:
+            return None
+        job_id = m.group(1)
+        return job_id if session_id.startswith(job_id) else None
+    return None
+
+
+def _pane_runs_claude(pane_id: str) -> bool | None:
+    """Whether Claude is in the pane's foreground; None when Herdr cannot tell."""
+    pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
+    if not pinfo or "result" not in pinfo:
+        return None
+    fg = pinfo["result"].get("process_info", {}).get("foreground_processes", [])
+    return any(_is_claude_proc(p) for p in fg)
+
+
+def reattach_viewers_after_restore(timeout: float = 120.0, interval: float = 2.0, settle: float = 20.0,
+                                   sleep=time.sleep, clock=time.monotonic) -> list[tuple[str, str]]:
+    """Startup hook: run `claude attach <job>` where the restart's resume was refused.
+
+    Herdr resumes a Claude pane with `claude --resume <id>` from its stored reference, and
+    there is no way to change that command without a custom reporter holding the pane --
+    which makes Herdr stop reading the screen and freezes the pane's status. So viewer panes
+    keep an ordinary reference to the background session they display (see sync_pane), the
+    resume is refused while that session still runs, and this hook follows Claude's own
+    advice afterwards. A pane is attached at most once per startup, and only from a shell.
+    Panes still running Claude are done; the loop ends once nothing is waiting after
+    `settle` seconds, or at `timeout`.
+    """
+    import subprocess
+
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    attached: list[tuple[str, str]] = []
+    handled: set[str] = set()
+    start = clock()
+    while True:
+        res = herdr_rpc("pane.list")
+        panes = res.get("result", {}).get("panes", []) if res else []
+        pending = 0
+        for pane in panes:
+            pane_id = pane.get("pane_id")
+            ref = pane.get("agent_session") or {}
+            sid = ref.get("value")
+            if not pane_id or pane_id in handled or ref.get("agent") != "claude" or ref.get("kind") != "id":
+                continue
+            if not isinstance(sid, str) or _pane_runs_claude(pane_id) is not False:
+                continue
+            read = herdr_rpc("pane.read", {"pane_id": pane_id, "source": "recent-unwrapped", "lines": 12})
+            text = read.get("result", {}).get("read", {}).get("text", "") if read else ""
+            job_id = find_bg_resume_refusal(text, sid)
+            if not job_id:
+                pending += 1
+                continue
+            handled.add(pane_id)
+            try:
+                subprocess.run([herdr, "pane", "run", pane_id, f"claude attach {job_id}"],
+                               capture_output=True, timeout=5)
+                attached.append((pane_id, job_id))
+            except Exception:
+                pass
+        elapsed = clock() - start
+        if elapsed >= timeout or (pending == 0 and elapsed >= settle):
+            return attached
+        sleep(interval)
+
+
 def sync_pane(pane: dict, state: StateManager) -> bool:
     pane_id = pane.get("pane_id")
     if not pane_id:
@@ -649,32 +743,34 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
         target_title = screen_title
 
     # Priority 2: Direct foreground process inspection (PID -> sessions/{pid}.json or CLI args)
-    # Physically immune to stale Herdr state or background subagent hijacking
-    if not target_title:
-        fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd, current_title or current_label)
-        if fg_sid:
-            # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
-            # report the authoritative session back to Herdr with monotonic sequence and resume source.
-            # Durability guard: a session UUID is allocated at SessionStart but its transcript .jsonl is only
-            # written once the first user message lands. Persisting an unwritten UUID makes `claude --resume`
-            # fail with "No conversation found with session ID" after a Herdr restart, so only report a
-            # session that is already durable on disk.
-            if session_id != fg_sid and is_valid_cc_session(fg_sid):
-                herdr_rpc("pane.report_agent_session", {
-                    "pane_id": pane_id,
-                    "source": "herdr:claude",
-                    "agent": "claude",
-                    "agent_session_id": fg_sid,
-                    "seq": time.time_ns(),
-                    "session_start_source": "resume",
-                })
-                session_id = fg_sid
+    # Physically immune to stale Herdr state or background subagent hijacking.
+    # Runs even when the screen already gave a title: a viewer pane always shows one, and
+    # skipping here would leave its binding stale. The screen title is also the name the
+    # viewer displays, so it is the best hint for the background-session join.
+    fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd, screen_title or current_title or current_label)
+    if fg_sid:
+        # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
+        # report the authoritative session back to Herdr with monotonic sequence and resume source.
+        # Durability guard: a session UUID is allocated at SessionStart but its transcript .jsonl is only
+        # written once the first user message lands. Persisting an unwritten UUID makes `claude --resume`
+        # fail with "No conversation found with session ID" after a Herdr restart, so only report a
+        # session that is already durable on disk.
+        if session_id != fg_sid and is_valid_cc_session(fg_sid):
+            herdr_rpc("pane.report_agent_session", {
+                "pane_id": pane_id,
+                "source": "herdr:claude",
+                "agent": "claude",
+                "agent_session_id": fg_sid,
+                "seq": time.time_ns(),
+                "session_start_source": "resume",
+            })
+            session_id = fg_sid
 
-            if fg_title:
-                target_title = fg_title
-                state.set_assigned_title(session_id, target_title)
-        elif fg_title:
+        if fg_title and not target_title:
             target_title = fg_title
+            state.set_assigned_title(session_id, target_title)
+    elif fg_title and not target_title:
+        target_title = fg_title
 
     # Priority 3: When Claude is not running in foreground, prioritize physical PTY terminal title
     # (e.g. btop, yazi, vim, git, etc.) over stale historical session transcript
@@ -743,11 +839,16 @@ def main():
     parser.add_argument("--event", action="store_true", help="Handle herdr event")
     parser.add_argument("--pane-current", action="store_true", help="Sync current pane")
     parser.add_argument("--status", action="store_true", help="Show sync status")
+    parser.add_argument("--reattach", action="store_true",
+                        help="Startup: attach panes whose restart resume was refused for a running background session")
 
     args = parser.parse_args()
     state = StateManager(get_state_dir())
 
-    if args.event:
+    if args.reattach:
+        for pane_id, job_id in reattach_viewers_after_restore():
+            print(f"Session Sync: {pane_id} -> claude attach {job_id}")
+    elif args.event:
         event_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
         if event_raw:
             try:
