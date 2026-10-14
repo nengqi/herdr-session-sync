@@ -13,10 +13,13 @@ Auto-sync Claude Code, Codex & Agent session names across Herdr pane labels, PTY
   `~/.config/herdr/local-plugins/session-sync/` was never what ran and has been removed.
 
 ## Restart reattach for viewer panes
-A viewer pane is bound to the background session it displays. On restart Herdr runs
-`claude --resume <that id>`; Claude refuses while the session still runs in the background
-and prints `Run \`claude attach <job>\``, and the `--reattach` startup hook runs exactly that.
-If the session stopped meanwhile, the resume simply reopens it in the pane.
+A viewer pane is bound to the background session it displays. On restart Herdr types
+`claude --resume <that id>` into the pane's shell. The user's zsh launcher (`ca` in
+`~/.zshrc`, `_claude_bg_resume_args`) rewrites exactly that form to `claude attach <job>`
+whenever `~/.claude/jobs/<job>/state.json` exists, so both a running and an exited background
+session reopen in place; a plain resume of an exited one would later `/bg` into a
+"name (2)" copy. Where that launcher is not loaded, Claude refuses the resume of a running
+session and prints `Run \`claude attach <job>\``, and the `--reattach` startup hook runs it.
 
 Do not move this to a custom `resume_argv`: Herdr only accepts one from a source holding the
 pane through `pane.report_agent`, and while held it stops reading the screen, so the pane's
