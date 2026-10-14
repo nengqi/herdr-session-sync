@@ -907,6 +907,9 @@ def main():
         for pane_id, job_id in reattach_viewers_after_restore():
             print(f"Session Sync: {pane_id} -> claude attach {job_id}")
     elif args.event:
+        # A manual `herdr integration install claude` drops the guard mid-session; every
+        # event re-checks it (one small file read), so it does not wait for a server restart.
+        ensure_hook_guard(default_claude_hook_path())
         event_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
         if event_raw:
             try:
