@@ -604,6 +604,39 @@ class TestSyncTitle(unittest.TestCase):
         self.assertEqual(mock_run.call_args[0][0],
                          ["/x/herdr", "pane", "run", "w1:pA", "claude attach 3eae96f6"])
 
+    def test_ensure_hook_guard(self):
+        """Herdr owns herdr-agent-state.sh and rewrites it on every integration install, so the
+        background-session guard is laid over the shipped file: added once, skipped when the
+        file already has one (e.g. after Herdr fixes herdr#5261), and never forced onto a file
+        whose anchor line moved."""
+        import tempfile
+        from pathlib import Path
+        from sync import ensure_hook_guard, HOOK_GUARD_ANCHOR
+
+        shipped = ("#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=10\n"
+                   '[ "${HERDR_ENV:-}" = "1" ] || exit 0\n' + HOOK_GUARD_ANCHOR +
+                   "command -v python3 >/dev/null 2>&1 || exit 0\n")
+        with tempfile.TemporaryDirectory() as d:
+            hook = Path(d) / "herdr-agent-state.sh"
+            hook.write_text(shipped)
+            hook.chmod(0o755)
+            self.assertEqual(ensure_hook_guard(hook), "patched")
+            patched = hook.read_text()
+            self.assertIn('[ -z "${CLAUDE_JOB_DIR:-}" ] || exit 0', patched)
+            self.assertLess(patched.index(HOOK_GUARD_ANCHOR), patched.index("CLAUDE_JOB_DIR"))
+            self.assertLess(patched.index("CLAUDE_JOB_DIR"), patched.index("command -v python3"))
+            self.assertEqual(hook.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(ensure_hook_guard(hook), "already-guarded")
+            self.assertEqual(hook.read_text(), patched)
+
+            hook.write_text(shipped.replace(HOOK_GUARD_ANCHOR, '[ -n "$HERDR_PANE_ID" ] || exit 0\n'))
+            self.assertEqual(ensure_hook_guard(hook), "anchor-missing")
+            self.assertNotIn("CLAUDE_JOB_DIR", hook.read_text())
+
+            hook.write_text("#!/bin/sh\n# HERDR_INTEGRATION_ID=codex\n" + HOOK_GUARD_ANCHOR)
+            self.assertEqual(ensure_hook_guard(hook), "not-claude-hook")
+            self.assertEqual(ensure_hook_guard(Path(d) / "missing.sh"), "no-hook")
+
     def test_is_live_claude_process_rejects_impostors(self):
         """signal 0 only proves a pid is taken; identity needs the command and procStart."""
         from unittest.mock import patch

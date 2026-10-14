@@ -729,6 +729,52 @@ def reattach_viewers_after_restore(timeout: float = 120.0, interval: float = 2.0
         sleep(interval)
 
 
+HOOK_GUARD_ANCHOR = '[ -n "${HERDR_PANE_ID:-}" ] || exit 0\n'
+HOOK_GUARD = (
+    "# Added by herdr-session-sync (herdrdev/herdr#5261): a background session (`claude --bg`,\n"
+    "# `/background`) inherits HERDR_PANE_ID from whatever terminal started Claude's daemon and\n"
+    "# owns no pane, so reporting it binds an unrelated pane. Herdr rewrites this file on\n"
+    "# integration install; the plugin's startup hook lays this line over it again.\n"
+    '[ -z "${CLAUDE_JOB_DIR:-}" ] || exit 0\n'
+)
+
+
+def default_claude_hook_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "hooks" / "herdr-agent-state.sh"
+
+
+def ensure_hook_guard(hook_path: Path) -> str:
+    """Startup hook: keep Herdr's own Claude hook, plus a guard against background sessions.
+
+    The file stays Herdr's (so `herdr integration install` keeps it current); only one guard
+    line is laid over it, right after the shipped HERDR_PANE_ID check. A file that already
+    checks CLAUDE_JOB_DIR is left alone, and so is one whose anchor line changed -- patching
+    an unknown shape could break the hook, a missing guard only brings back herdr#5261.
+    """
+    try:
+        content = hook_path.read_text(encoding="utf-8")
+    except OSError:
+        return "no-hook"
+    if "HERDR_INTEGRATION_ID=claude" not in content:
+        return "not-claude-hook"
+    if "CLAUDE_JOB_DIR" in content:
+        return "already-guarded"
+    if content.count(HOOK_GUARD_ANCHOR) != 1:
+        return "anchor-missing"
+    patched = content.replace(HOOK_GUARD_ANCHOR, HOOK_GUARD_ANCHOR + HOOK_GUARD)
+    mode = hook_path.stat().st_mode & 0o777
+    tmp = hook_path.with_name(f".{hook_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(patched, encoding="utf-8")
+        tmp.chmod(mode)
+        tmp.replace(hook_path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return "write-failed"
+    return "patched"
+
+
 def sync_pane(pane: dict, state: StateManager) -> bool:
     pane_id = pane.get("pane_id")
     if not pane_id:
@@ -848,11 +894,16 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show sync status")
     parser.add_argument("--reattach", action="store_true",
                         help="Startup: attach panes whose restart resume was refused for a running background session")
+    parser.add_argument("--ensure-hook-guard", action="store_true",
+                        help="Startup: lay the background-session guard over Herdr's Claude hook")
 
     args = parser.parse_args()
     state = StateManager(get_state_dir())
 
-    if args.reattach:
+    if args.ensure_hook_guard:
+        hook = default_claude_hook_path()
+        print(f"Session Sync: {hook} -> {ensure_hook_guard(hook)}")
+    elif args.reattach:
         for pane_id, job_id in reattach_viewers_after_restore():
             print(f"Session Sync: {pane_id} -> claude attach {job_id}")
     elif args.event:
