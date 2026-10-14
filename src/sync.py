@@ -643,9 +643,11 @@ def find_bg_resume_refusal(text: str, session_id: str) -> str | None:
     "That session is running in the background (<job>). Run `claude attach <job>` ..."
     and drops back to the shell -- the job id there is Claude's own answer to "what does
     this pane display". Accept it only when the echoed command right above is the
-    `--resume` of this pane's session and at most the shell prompt follows; anything older
-    is history, and attaching on history would type into whatever runs there now. The id
-    is typed into a shell, so it must be a plain alphanumeric token.
+    `--resume` of this pane's session and at most the shell prompt follows the message;
+    anything older is history, and attaching on history would type into whatever runs
+    there now. Claude hard-wraps the message to the terminal width, so it ends at the first
+    line closing with a period, a few lines down at most. The id is typed into a shell, so
+    it must be a plain alphanumeric token.
     """
     if not text or not session_id:
         return None
@@ -654,7 +656,8 @@ def find_bg_resume_refusal(text: str, session_id: str) -> str | None:
         m = BG_REFUSAL_RE.search(lines[i])
         if not m:
             continue
-        if len(lines) - 1 - i > 1 or i == 0:
+        end = next((j for j in range(i, min(i + 3, len(lines))) if lines[j].rstrip().endswith(".")), None)
+        if end is None or len(lines) - 1 - end > 1 or i == 0:
             return None
         if "--resume" not in lines[i - 1] or session_id not in lines[i - 1]:
             return None
@@ -682,28 +685,32 @@ def reattach_viewers_after_restore(timeout: float = 120.0, interval: float = 2.0
     keep an ordinary reference to the background session they display (see sync_pane), the
     resume is refused while that session still runs, and this hook follows Claude's own
     advice afterwards. A pane is attached at most once per startup, and only from a shell.
-    Panes still running Claude are done; the loop ends once nothing is waiting after
-    `settle` seconds, or at `timeout`.
+    Herdr drops a pane's reference shortly after its resume falls back to the shell, so the
+    reference is remembered from the first listing that showed it. Panes still running
+    Claude are done; the loop ends once nothing is waiting after `settle` seconds, or at
+    `timeout`.
     """
     import subprocess
 
     herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
     attached: list[tuple[str, str]] = []
     handled: set[str] = set()
+    known: dict[str, str] = {}
     start = clock()
     while True:
         res = herdr_rpc("pane.list")
         panes = res.get("result", {}).get("panes", []) if res else []
-        pending = 0
         for pane in panes:
-            pane_id = pane.get("pane_id")
             ref = pane.get("agent_session") or {}
-            sid = ref.get("value")
-            if not pane_id or pane_id in handled or ref.get("agent") != "claude" or ref.get("kind") != "id":
+            if pane.get("pane_id") and ref.get("agent") == "claude" and ref.get("kind") == "id" \
+                    and isinstance(ref.get("value"), str):
+                known.setdefault(pane["pane_id"], ref["value"])
+        live = {p.get("pane_id") for p in panes}
+        pending = 0
+        for pane_id, sid in known.items():
+            if pane_id in handled or pane_id not in live or _pane_runs_claude(pane_id) is not False:
                 continue
-            if not isinstance(sid, str) or _pane_runs_claude(pane_id) is not False:
-                continue
-            read = herdr_rpc("pane.read", {"pane_id": pane_id, "source": "recent-unwrapped", "lines": 12})
+            read = herdr_rpc("pane.read", {"pane_id": pane_id, "source": "recent_unwrapped", "lines": 12})
             text = read.get("result", {}).get("read", {}).get("text", "") if read else ""
             job_id = find_bg_resume_refusal(text, sid)
             if not job_id:

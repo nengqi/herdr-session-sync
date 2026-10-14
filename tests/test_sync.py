@@ -532,6 +532,10 @@ class TestSyncTitle(unittest.TestCase):
             " ~/work                                                          ✘ 1  24.7.0\n"
         )
         self.assertEqual(find_bg_resume_refusal(screen, sid), "3eae96f6")
+        # Claude hard-wraps the message to the terminal width; the tail is still the same message.
+        wrapped = screen.replace(" Add --fork-session to branch off a copy instead.",
+                                 " Add --fork-session to branch\noff a copy instead.")
+        self.assertEqual(find_bg_resume_refusal(wrapped, sid), "3eae96f6")
         # Another session's refusal must not attach this pane.
         self.assertIsNone(find_bg_resume_refusal(screen, "deb10810-c9c2-437a-8867-3be43498737e"))
         # A refusal followed by later commands is history, not the restart's resume.
@@ -550,7 +554,8 @@ class TestSyncTitle(unittest.TestCase):
 
         sid = "3eae96f6-42f7-4349-8bc1-111e0b6f04e5"
         refusal = (" ~/w claude --resume " + sid + "\n"
-                   "That session is running in the background (3eae96f6). Run `claude attach 3eae96f6`\n"
+                   "That session is running in the background (3eae96f6). Run `claude attach 3eae96f6`"
+                   " to open it, or `claude stop 3eae96f6` first to resume it here.\n"
                    " ~/w\n")
         ref = lambda v: {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": v}
         panes = [{"pane_id": "w1:pA", "agent_session": ref(sid)},
@@ -565,11 +570,31 @@ class TestSyncTitle(unittest.TestCase):
             if method == "pane.process_info":
                 return {"result": {"process_info": {"foreground_processes": fg[params["pane_id"]]}}}
             if method == "pane.read":
+                # Herdr's JSON API spells this enum with underscores (the CLI uses dashes).
+                if params.get("source") not in {"visible", "recent", "recent_unwrapped", "detection"}:
+                    return {"error": {"code": "invalid_request"}}
                 return {"result": {"read": {"text": refusal}}}
             return None
 
         ticks = iter(range(0, 1000, 10))
-        with patch("sync.herdr_rpc", side_effect=fake_rpc), \
+        lists = []
+
+        def listing():
+            # Herdr drops a pane's reference once its refused resume is back at the shell,
+            # so the reference may be gone by the time the refusal shows up.
+            lists.append(1)
+            if len(lists) > 1:
+                return [{"pane_id": "w1:pA"}] + panes[1:]
+            return panes
+
+        def fake_rpc_dropping(method, params=None, timeout=1.5):
+            if method == "pane.list":
+                return {"result": {"panes": listing()}}
+            if method == "pane.read" and len(lists) == 1:
+                return {"result": {"read": {"text": " ~/w\n"}}}  # resume not run yet
+            return fake_rpc(method, params, timeout)
+
+        with patch("sync.herdr_rpc", side_effect=fake_rpc_dropping), \
              patch("subprocess.run") as mock_run, \
              patch.dict("os.environ", {"HERDR_BIN_PATH": "/x/herdr"}):
             attached = reattach_viewers_after_restore(
