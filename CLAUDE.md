@@ -15,7 +15,7 @@ Auto-sync Claude Code, Codex & Agent session names across Herdr pane labels, PTY
 ## Restart reattach for viewer panes
 A viewer pane is bound to the background session it displays. On restart Herdr types
 `claude --resume <that id>` into the pane's shell. The user's zsh launcher (`ca` in
-`~/.zshrc`, the check lives inside the function body) rewrites exactly that form to `claude attach <job>`
+`~/.zshrc`, the check lives inside the function body) rewrites that form (and `-a`/`attach` with a full or 8-character id) to `claude attach <job>`
 whenever `${CLAUDE_CONFIG_DIR:-~/.claude}/jobs/<job>/state.json` names it, so both a running and an exited background
 session reopen in place; a plain resume of an exited one would later `/bg` into a
 "name (2)" copy. Where that launcher is not loaded, Claude refuses the resume of a running
