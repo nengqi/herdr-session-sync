@@ -61,6 +61,13 @@ unsure, report nothing.
 `resolve_live_bg_session_by_name` is the one weak link — see its docstring for why the name
 is a guess and which stronger keys were already ruled out.
 
+The `attach <id>` in argv goes stale too: from the agents list (e.g. after `claude respawn`
+kicks the viewer back to it) the same process can open another session, and its
+`claude agents` child leaves no `sessions/<pid>.json`. So when the live screen title differs
+from the argv session's name and exactly one live background session claims it, that session
+wins. Only for `attach` (a plain `--resume` cannot switch), and pass the screen title only —
+never the pane label, which may echo an earlier bind.
+
 ## Herdr's Claude hook stays Herdr's
 `~/.claude/hooks/herdr-agent-state.sh` is Herdr's file (`herdr integration status` reads
 `current`), so Herdr keeps it up to date. herdrdev/herdr#5261 (a background session inherits

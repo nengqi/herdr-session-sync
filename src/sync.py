@@ -562,8 +562,13 @@ def _is_claude_proc(proc: dict) -> bool:
     )
 
 
-def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name: str = "") -> tuple[str | None, str | None]:
-    """Inspects pane.process_info to resolve session_id and title directly from PID or CLI args (attach/--resume/--name)."""
+def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name: str = "",
+                                         screen_title: str = "") -> tuple[str | None, str | None]:
+    """Inspects pane.process_info to resolve session_id and title directly from PID or CLI args (attach/--resume/--name).
+
+    `screen_title` must come from the live screen only (never the pane label, which can be an
+    echo of an earlier binding); it is used to correct a stale `attach` id in argv.
+    """
     try:
         pinfo = herdr_rpc("pane.process_info", {"pane_id": pane_id})
         if not pinfo:
@@ -603,6 +608,14 @@ def resolve_title_from_foreground_process(pane_id: str, cwd: str = "", pane_name
                             sid = os.path.basename(m)[:-6]
                             if is_valid_cc_session(sid):
                                 title = extract_cc_session_name(sid, cwd)
+                                # A `claude attach` viewer can switch to another session from
+                                # its agents list without changing argv, so this id may be stale.
+                                # If the screen shows a different title that exactly one live
+                                # background session claims, that is what the pane displays.
+                                if flag == "attach" and screen_title and title != screen_title:
+                                    shown_sid, shown_title = resolve_live_bg_session_by_name(screen_title)
+                                    if shown_sid and shown_sid != sid:
+                                        return shown_sid, shown_title
                                 return sid, title
                     elif flag != "attach":
                         return None, sanitize_title(val)[:32]
@@ -846,7 +859,8 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     # Runs even when the screen already gave a title: a viewer pane always shows one, and
     # skipping here would leave its binding stale. The screen title is also the name the
     # viewer displays, so it is the best hint for the background-session join.
-    fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd, screen_title or current_title or current_label)
+    fg_sid, fg_title = resolve_title_from_foreground_process(pane_id, cwd, screen_title or current_title or current_label,
+                                                             screen_title=screen_title or "")
     if fg_sid:
         # Auto-heal: If Herdr's recorded agent_session doesn't match the authoritative foreground session,
         # report the authoritative session back to Herdr with monotonic sequence and resume source.
