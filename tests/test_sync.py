@@ -494,6 +494,61 @@ class TestSyncTitle(unittest.TestCase):
              patch("sync.is_valid_cc_session", return_value=True):
             self.assertEqual(resolve_live_bg_session_by_name("bytedance-d1"), (None, None))
 
+    def test_attach_viewer_switched_in_agents_list_follows_screen_title(self):
+        """`claude attach A` can switch to session B from its agents list without changing
+        argv, and the `claude agents` child leaves no sessions/<pid>.json. When the screen
+        title names a different live background session, bind to that one, not stale A."""
+        from unittest.mock import patch
+        from sync import resolve_title_from_foreground_process
+
+        old_sid = "9c9f55f1-30b0-4ad1-8241-632561c0a677"
+        shown_sid = "6db10eb2-9126-4d4f-b1ae-4be8280c31c7"
+        procs = [
+            {"pid": 97309, "argv0": "claude", "name": "2.1.301",
+             "argv": ["/Users/u/.local/bin/claude", "agents", "--settings", "/Users/u/s.json"]},
+            {"pid": 97304, "argv0": "sh", "name": "bash",
+             "argv": ["/bin/sh", "/usr/bin/command", "claude", "--settings", "/Users/u/s.json",
+                      "attach", old_sid[:8]]},
+        ]
+        pinfo = {"result": {"process_info": {"foreground_processes": procs}}}
+
+        for screen, name_hit, expected in (
+            ("loop Astergate Gemini Claude", (shown_sid, "loop Astergate Gemini Claude"), shown_sid),
+            ("loop 工作上下文", (old_sid, "loop 工作上下文"), old_sid),   # screen agrees with argv
+            ("", (shown_sid, "x"), old_sid),                              # no screen title: keep argv
+            ("loop Astergate Gemini Claude", (None, None), old_sid),      # name not unique/live: keep argv
+        ):
+            with self.subTest(screen=screen, name_hit=name_hit), \
+                 patch("sync.herdr_rpc", return_value=pinfo), \
+                 patch("sync._read_interactive_session", return_value={}), \
+                 patch("sync.glob.glob", return_value=[f"/p/x/{old_sid}.jsonl"]), \
+                 patch("sync.os.path.isfile", return_value=True), \
+                 patch("sync.os.path.getmtime", return_value=0), \
+                 patch("sync.is_valid_cc_session", return_value=True), \
+                 patch("sync.extract_cc_session_name", return_value="loop 工作上下文"), \
+                 patch("sync.resolve_live_bg_session_by_name", return_value=name_hit) as by_name:
+                sid, _ = resolve_title_from_foreground_process("w1:pQ5", "/Users/u", screen or "label",
+                                                               screen_title=screen)
+                self.assertEqual(sid, expected)
+                if screen in ("", "loop 工作上下文"):
+                    by_name.assert_not_called()
+
+        # Only an attach viewer can switch sessions; a plain `--resume` keeps its argv id.
+        resume = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 1, "argv0": "claude", "argv": ["claude", "--resume", old_sid]}]}}}
+        with patch("sync.herdr_rpc", return_value=resume), \
+             patch("sync._read_interactive_session", return_value={}), \
+             patch("sync.glob.glob", return_value=[f"/p/x/{old_sid}.jsonl"]), \
+             patch("sync.os.path.isfile", return_value=True), \
+             patch("sync.os.path.getmtime", return_value=0), \
+             patch("sync.is_valid_cc_session", return_value=True), \
+             patch("sync.extract_cc_session_name", return_value="loop 工作上下文"), \
+             patch("sync.resolve_live_bg_session_by_name", return_value=(shown_sid, "x")) as by_name:
+            sid, _ = resolve_title_from_foreground_process("w1:p1", "", "loop Astergate Gemini Claude",
+                                                           screen_title="loop Astergate Gemini Claude")
+            self.assertEqual(sid, old_sid)
+            by_name.assert_not_called()
+
 
     def test_fresh_unwritten_session_is_not_rebound_by_name(self):
         """A session nobody has typed into yet has no transcript, but it is not a viewer.
