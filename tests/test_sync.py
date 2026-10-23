@@ -66,6 +66,23 @@ class TestSyncTitle(unittest.TestCase):
         text_msg_only = "<command-message>chat-catchup</command-message>"
         self.assertEqual(clean_task_title(text_msg_only), "chat-catchup")
 
+    def test_clean_botmux_wrapped_prompt(self):
+        botmux_prompt = (
+            '<role context="team" chat_id="oc_67e53abf191db8bde477f3d019351992">\n'
+            '这是齐能派的一件事...\n'
+            '</role>\n\n'
+            '<whiteboard id="wb_80bb7239663c4c5a">\n'
+            '本地项目上下文\n'
+            '</whiteboard>\n\n'
+            '<user_message>\n'
+            '开源蟑螂\n'
+            '</user_message>\n\n'
+            '<sender type="user" name="齐能" />'
+        )
+        self.assertEqual(clean_task_title(botmux_prompt), "开源蟑螂")
+        self.assertIsNone(clean_task_title('<role context="team">only role</role>'))
+        self.assertIsNone(clean_task_title('<cross-session-message from="管家">hi</cross-session-message>'))
+
     def test_sanitize_title(self):
         self.assertEqual(sanitize_title("normal title"), "normal title")
         self.assertEqual(sanitize_title("title\x07\x1b[6ninjected"), "titleinjected")
@@ -993,6 +1010,81 @@ class TestSyncTitle(unittest.TestCase):
         with patch("sync.herdr_rpc", return_value=fake_res):
             title = extract_title_from_screen("w1:p1")
             self.assertEqual(title, "Moshi")
+
+    def test_reconcile_moshi_claude_sessions(self):
+        """Moshi's resolveHerdrAgentSession scores claude-sessions/*.json by (herdrPane, herdrTabId).
+        Viewer panes (`claude attach`) never write herdrPane into claude-sessions/*.json on their own,
+        while parked/closed sessions leave stale herdrPane + herdrTabId entries that hijack same-tab
+        panes or trigger claudeAttachedSession to wipe sessions to None. Reconciling stamps active
+        pane bindings (score 200) and strips stale herdr* fields."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        viewer_sid = "b291db7e-83be-4000-9147-f2973dd791c6"
+        missing_sid = "735fe020-128e-4afb-b863-deabfd570760"
+        stale_parked_sid = "9fc585ba-1eb9-40cd-974f-7fb36a0e9c8d"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            (moshi_dir / f"{viewer_sid}.json").write_text(json.dumps({
+                "model": "Opus",
+                "sessionStartTime": 100.0,
+                "lastStopTime": 200.0,
+            }))
+            (moshi_dir / f"{stale_parked_sid}.json").write_text(json.dumps({
+                "model": "Opus",
+                "sessionStartTime": 300.0,
+                "lastStopTime": 250.0,
+                "terminalKind": "herdr",
+                "herdrWorkspaceId": "w1",
+                "herdrWorkspace": "~",
+                "herdrPane": "w1:pVV",
+                "herdrTabId": "w1:t7B",
+                "herdrTab": "2 紧急重要",
+            }))
+
+            panes = [
+                {
+                    "pane_id": "w1:pQT",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t7B",
+                    "cwd": "/Users/bytedance/work",
+                    "agent_session": {"agent": "claude", "kind": "id", "value": viewer_sid},
+                },
+                {
+                    "pane_id": "w1:pWH",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1JY",
+                    "cwd": "/Users/bytedance/other",
+                    "agent_session": {"agent": "claude", "kind": "id", "value": missing_sid},
+                },
+            ]
+
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True):
+                changed = reconcile_moshi_claude_sessions(panes)
+                self.assertEqual(changed, 3)
+                # Second run is idempotent (0 writes)
+                self.assertEqual(reconcile_moshi_claude_sessions(panes), 0)
+
+            viewer_data = json.loads((moshi_dir / f"{viewer_sid}.json").read_text())
+            self.assertEqual(viewer_data["terminalKind"], "herdr")
+            self.assertEqual(viewer_data["herdrWorkspaceId"], "w1")
+            self.assertEqual(viewer_data["herdrPane"], "w1:pQT")
+            self.assertEqual(viewer_data["herdrTabId"], "w1:t7B")
+            self.assertEqual(viewer_data["model"], "Opus")
+
+            missing_data = json.loads((moshi_dir / f"{missing_sid}.json").read_text())
+            self.assertEqual(missing_data["terminalKind"], "herdr")
+            self.assertEqual(missing_data["herdrPane"], "w1:pWH")
+            self.assertEqual(missing_data["herdrTabId"], "w1:t1JY")
+            self.assertEqual(missing_data["cwd"], "/Users/bytedance/other")
+
+            stale_data = json.loads((moshi_dir / f"{stale_parked_sid}.json").read_text())
+            self.assertEqual(stale_data["model"], "Opus")
+            for key in ("terminalKind", "herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace"):
+                self.assertNotIn(key, stale_data)
 
 
 if __name__ == "__main__":

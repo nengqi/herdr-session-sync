@@ -123,6 +123,15 @@ def clean_task_title(text: str) -> str | None:
     if not text:
         return None
 
+    # Extract inner user prompt from BotMux envelope if present
+    if "<user_message>" in text:
+        um_match = re.search(r"<user_message>(.*?)</user_message>", text, re.DOTALL)
+        if not um_match:
+            return None
+        text = um_match.group(1).strip()
+        if not text:
+            return None
+
     # Filter out internal system instructions / skill headers / reminders
     if (
         "Base directory for this skill:" in text
@@ -131,6 +140,10 @@ def clean_task_title(text: str) -> str | None:
         or text.startswith("<task-notification>")
         or text.startswith("<local-command-")
         or text.startswith("<user-prompt-submit")
+        or text.startswith("<role")
+        or text.startswith("<whiteboard")
+        or text.startswith("<sender")
+        or text.startswith("<cross-session-message")
         or text.startswith("Ran ")
         or text.startswith("Task #")
         or text.startswith("UserPromptSubmit")
@@ -803,6 +816,126 @@ def default_claude_hook_path() -> Path:
     return claude_config_dir() / "hooks" / "herdr-agent-state.sh"
 
 
+def moshi_claude_sessions_dir() -> Path:
+    raw = os.environ.get("MOSHI_CLAUDE_SESSIONS_DIR")
+    if raw:
+        return Path(raw)
+    return Path.home() / "Library" / "Application Support" / "Moshi" / "claude-sessions"
+
+
+def _write_json_atomic(path: Path, data: dict) -> bool:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
+    """Ensure Moshi's claude-sessions/<session_id>.json records this Herdr pane and tab.
+
+    Moshi's resolveHerdrAgentSession scores claude-sessions/*.json against (pane_id, tab_id):
+    an exact (herdrPane, herdrTabId) match scores 200, while another pane in the same tab
+    scores 120. Viewer panes (`claude attach`) run their conversation under cc-daemon and
+    never write herdrPane through moshi-hook's shell-PID lookup, leaving them at score 0 and
+    vulnerable to same-tab hijacking (or None-wiping when a parked viewer session is picked).
+    """
+    if "unittest" in sys.modules and not os.environ.get("MOSHI_CLAUDE_SESSIONS_DIR"):
+        return False
+    if not session_id or not isinstance(session_id, str):
+        return False
+    session_id = session_id.strip()
+    if not re.match(r"^[0-9a-fA-F-]{6,36}$", session_id):
+        return False
+    pane_id = (pane.get("pane_id") or "").strip()
+    if not pane_id:
+        return False
+    moshi_dir = moshi_claude_sessions_dir()
+    if not moshi_dir.is_dir():
+        return False
+
+    tab_id = (pane.get("tab_id") or "").strip()
+    workspace_id = (pane.get("workspace_id") or (pane_id.split(":")[0] if ":" in pane_id else "")).strip()
+    cwd = (pane.get("foreground_cwd") or pane.get("cwd") or "").strip()
+
+    state_file = moshi_dir / f"{session_id}.json"
+    data: dict = {}
+    if state_file.is_file():
+        try:
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            return False
+    elif not is_valid_cc_session(session_id):
+        return False
+
+    if (
+        data.get("terminalKind") == "herdr"
+        and data.get("herdrPane") == pane_id
+        and (not tab_id or data.get("herdrTabId") == tab_id)
+        and (not workspace_id or data.get("herdrWorkspaceId") == workspace_id)
+    ):
+        return False
+
+    data["terminalKind"] = "herdr"
+    data["herdrPane"] = pane_id
+    if workspace_id:
+        data["herdrWorkspaceId"] = workspace_id
+    if tab_id:
+        data["herdrTabId"] = tab_id
+    if cwd and not data.get("cwd"):
+        data["cwd"] = cwd
+    return _write_json_atomic(state_file, data)
+
+
+def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
+    """Stamp active Herdr pane bindings into Moshi state and strip stale herdr* fields."""
+    if "unittest" in sys.modules and not os.environ.get("MOSHI_CLAUDE_SESSIONS_DIR"):
+        return 0
+    moshi_dir = moshi_claude_sessions_dir()
+    if not moshi_dir.is_dir():
+        return 0
+
+    active_pane_by_sid: dict[str, dict] = {}
+    for p in panes:
+        pane_id = (p.get("pane_id") or "").strip()
+        ref = p.get("agent_session") or {}
+        sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
+        if pane_id and sid and is_valid_cc_session(sid):
+            active_pane_by_sid[sid] = p
+
+    changed = 0
+    for sid, p in active_pane_by_sid.items():
+        if sync_moshi_pane_session(p, sid):
+            changed += 1
+
+    herdr_keys = ("herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace")
+    for path in moshi_dir.glob("*.json"):
+        sid = path.stem
+        if sid in active_pane_by_sid:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if not any(k in data for k in herdr_keys) and data.get("terminalKind") != "herdr":
+            continue
+        for k in herdr_keys:
+            data.pop(k, None)
+        if data.get("terminalKind") == "herdr":
+            data.pop("terminalKind", None)
+        if _write_json_atomic(path, data):
+            changed += 1
+
+    return changed
+
+
 def ensure_hook_guard(hook_path: Path) -> str:
     """Startup hook: keep Herdr's own Claude hook, plus a guard against background sessions.
 
@@ -878,12 +1011,21 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
                 "session_start_source": "resume",
             })
             session_id = fg_sid
+            pane["agent_session"] = {
+                "source": "herdr:claude",
+                "agent": "claude",
+                "kind": "id",
+                "value": fg_sid,
+            }
 
         if fg_title and not target_title:
             target_title = fg_title
             state.set_assigned_title(session_id, target_title)
     elif fg_title and not target_title:
         target_title = fg_title
+
+    if session_id:
+        sync_moshi_pane_session(pane, session_id)
 
     # Priority 3: When Claude is not running in foreground, prioritize physical PTY terminal title
     # (e.g. btop, yazi, vim, git, etc.) over stale historical session transcript
@@ -942,6 +1084,9 @@ def sync_all(state: StateManager):
     for p in panes:
         if sync_pane(p, state):
             count += 1
+    reconcile_moshi_claude_sessions(panes)
+    state.data["last_full_sync"] = time.time()
+    state.save()
     if count > 0:
         print(f"Session Sync: synced {count} panes.")
 
@@ -981,7 +1126,8 @@ def main():
                         pane = res["result"].get("pane")
                         if pane:
                             sync_pane(pane, state)
-                            return
+                            if time.time() - state.data.get("last_full_sync", 0) < 5.0:
+                                return
             except Exception:
                 pass
         sync_all(state)
