@@ -1169,13 +1169,14 @@ def main():
                             pane = res["result"].get("pane")
                             if pane:
                                 sync_pane(pane, state)
-                                # On a targeted pane event, syncing the pane stamps Moshi if needed.
-                                # Exit immediately; never fall through to a full sweep on rapid pane events.
-                                return
+                                # If all panes have been refreshed recently, return immediately (<5ms).
+                                # Otherwise, fall through to fast-path sync_all to keep idle panes fresh.
+                                if time.time() - state.data.get("last_full_sync", 0) < 60.0:
+                                    return
                 except Exception:
                     pass
-            # If no pane_id was found in event, only run sync_all if at least 15s has passed
-            if time.time() - state.data.get("last_full_sync", 0) >= 15.0:
+            # Run fast-path sync_all if at least 60s has passed
+            if time.time() - state.data.get("last_full_sync", 0) >= 60.0:
                 sync_all(state)
         finally:
             if lock_fd:
