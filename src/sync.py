@@ -824,9 +824,15 @@ def moshi_claude_sessions_dir() -> Path:
 
 
 def _write_json_atomic(path: Path, data: dict) -> bool:
+    # Moshi keeps these files owner-only; keep the original mode instead of the umask default.
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.chmod(mode)
         tmp.replace(path)
         return True
     except OSError:
@@ -900,12 +906,19 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
     if not moshi_dir.is_dir():
         return 0
 
+    # Every session a pane holds keeps its binding; only those with a transcript get stamped.
+    # A just-started session has none until its first prompt, but moshi-hook already recorded
+    # its pane -- stripping that would hand the pane to a same-tab session.
+    held_sids: set[str] = set()
     active_pane_by_sid: dict[str, dict] = {}
     for p in panes:
         pane_id = (p.get("pane_id") or "").strip()
         ref = p.get("agent_session") or {}
         sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
-        if pane_id and sid and is_valid_cc_session(sid):
+        if not (pane_id and sid):
+            continue
+        held_sids.add(sid)
+        if is_valid_cc_session(sid):
             active_pane_by_sid[sid] = p
 
     changed = 0
@@ -916,7 +929,7 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
     herdr_keys = ("herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace")
     for path in moshi_dir.glob("*.json"):
         sid = path.stem
-        if sid in active_pane_by_sid:
+        if sid in held_sids:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

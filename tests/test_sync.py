@@ -1086,6 +1086,57 @@ class TestSyncTitle(unittest.TestCase):
             for key in ("terminalKind", "herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace"):
                 self.assertNotIn(key, stale_data)
 
+    def test_reconcile_keeps_binding_of_session_without_transcript(self):
+        """A just-started session has no transcript until its first prompt, yet moshi-hook already
+        recorded its pane. Stripping that binding would let a same-tab session take the pane."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        fresh_sid = "6ca2f00d-d743-4c5d-9652-5d9c826f1f09"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            original = {"terminalKind": "herdr", "herdrPane": "w1:pX6", "herdrTabId": "w1:t1JY"}
+            (moshi_dir / f"{fresh_sid}.json").write_text(json.dumps(original))
+            panes = [{"pane_id": "w1:pX6", "tab_id": "w1:t1JY",
+                      "agent_session": {"agent": "claude", "kind": "id", "value": fresh_sid}}]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=False):
+                self.assertEqual(reconcile_moshi_claude_sessions(panes), 0)
+            self.assertEqual(json.loads((moshi_dir / f"{fresh_sid}.json").read_text()), original)
+
+    def test_moshi_rewrite_keeps_owner_only_mode(self):
+        """Moshi keeps claude-sessions/*.json at 0600; a rewrite must not widen it, and a file
+        created for a session Moshi never saw starts at 0600 too."""
+        import stat
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        existing_sid = "b291db7e-83be-4000-9147-f2973dd791c6"
+        new_sid = "735fe020-128e-4afb-b863-deabfd570760"
+        stale_sid = "9fc585ba-1eb9-40cd-974f-7fb36a0e9c8d"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            for sid, data in ((existing_sid, {"model": "Opus"}),
+                              (stale_sid, {"terminalKind": "herdr", "herdrPane": "w1:pVV"})):
+                path = moshi_dir / f"{sid}.json"
+                path.write_text(json.dumps(data))
+                path.chmod(0o600)
+            panes = [
+                {"pane_id": "w1:pQT", "tab_id": "w1:t7B",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": existing_sid}},
+                {"pane_id": "w1:pWH", "tab_id": "w1:t1JY",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": new_sid}},
+            ]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True):
+                self.assertEqual(reconcile_moshi_claude_sessions(panes), 3)
+
+            for sid in (existing_sid, new_sid, stale_sid):
+                mode = stat.S_IMODE((moshi_dir / f"{sid}.json").stat().st_mode)
+                self.assertEqual(mode, 0o600, sid)
+
 
 if __name__ == "__main__":
     unittest.main()
