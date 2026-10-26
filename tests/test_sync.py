@@ -1086,6 +1086,38 @@ class TestSyncTitle(unittest.TestCase):
             for key in ("terminalKind", "herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace"):
                 self.assertNotIn(key, stale_data)
 
+    def test_moshi_rewrite_keeps_owner_only_mode(self):
+        """Moshi keeps claude-sessions/*.json at 0600; a rewrite must not widen it, and a file
+        created for a session Moshi never saw starts at 0600 too."""
+        import stat
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        existing_sid = "b291db7e-83be-4000-9147-f2973dd791c6"
+        new_sid = "735fe020-128e-4afb-b863-deabfd570760"
+        stale_sid = "9fc585ba-1eb9-40cd-974f-7fb36a0e9c8d"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            for sid, data in ((existing_sid, {"model": "Opus"}),
+                              (stale_sid, {"terminalKind": "herdr", "herdrPane": "w1:pVV"})):
+                path = moshi_dir / f"{sid}.json"
+                path.write_text(json.dumps(data))
+                path.chmod(0o600)
+            panes = [
+                {"pane_id": "w1:pQT", "tab_id": "w1:t7B",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": existing_sid}},
+                {"pane_id": "w1:pWH", "tab_id": "w1:t1JY",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": new_sid}},
+            ]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True):
+                self.assertEqual(reconcile_moshi_claude_sessions(panes), 3)
+
+            for sid in (existing_sid, new_sid, stale_sid):
+                mode = stat.S_IMODE((moshi_dir / f"{sid}.json").stat().st_mode)
+                self.assertEqual(mode, 0o600, sid)
+
 
 if __name__ == "__main__":
     unittest.main()

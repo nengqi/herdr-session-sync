@@ -824,9 +824,15 @@ def moshi_claude_sessions_dir() -> Path:
 
 
 def _write_json_atomic(path: Path, data: dict) -> bool:
+    # Moshi keeps these files owner-only; keep the original mode instead of the umask default.
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.chmod(mode)
         tmp.replace(path)
         return True
     except OSError:
