@@ -1086,6 +1086,25 @@ class TestSyncTitle(unittest.TestCase):
             for key in ("terminalKind", "herdrPane", "herdrTabId", "herdrTab", "herdrWorkspaceId", "herdrWorkspace"):
                 self.assertNotIn(key, stale_data)
 
+    def test_reconcile_keeps_binding_of_session_without_transcript(self):
+        """A just-started session has no transcript until its first prompt, yet moshi-hook already
+        recorded its pane. Stripping that binding would let a same-tab session take the pane."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        fresh_sid = "6ca2f00d-d743-4c5d-9652-5d9c826f1f09"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            original = {"terminalKind": "herdr", "herdrPane": "w1:pX6", "herdrTabId": "w1:t1JY"}
+            (moshi_dir / f"{fresh_sid}.json").write_text(json.dumps(original))
+            panes = [{"pane_id": "w1:pX6", "tab_id": "w1:t1JY",
+                      "agent_session": {"agent": "claude", "kind": "id", "value": fresh_sid}}]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=False):
+                self.assertEqual(reconcile_moshi_claude_sessions(panes), 0)
+            self.assertEqual(json.loads((moshi_dir / f"{fresh_sid}.json").read_text()), original)
+
     def test_moshi_rewrite_keeps_owner_only_mode(self):
         """Moshi keeps claude-sessions/*.json at 0600; a rewrite must not widen it, and a file
         created for a session Moshi never saw starts at 0600 too."""
