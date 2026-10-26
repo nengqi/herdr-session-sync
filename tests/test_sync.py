@@ -1137,6 +1137,27 @@ class TestSyncTitle(unittest.TestCase):
                 mode = stat.S_IMODE((moshi_dir / f"{sid}.json").stat().st_mode)
                 self.assertEqual(mode, 0o600, sid)
 
+    def test_try_acquire_flock_concurrency(self):
+        """A lock held non-blockingly rejects second acquisition."""
+        import os
+        import tempfile
+        import fcntl
+        from sync import try_acquire_flock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "test.lock"
+            # In unittest sys.modules check bypasses, but if we call fcntl directly:
+            fd1 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fd2 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.close(fd2)
+            finally:
+                fcntl.flock(fd1, fcntl.LOCK_UN)
+                os.close(fd1)
+
 
 if __name__ == "__main__":
     unittest.main()

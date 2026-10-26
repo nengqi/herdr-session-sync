@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import fcntl
 import glob
 import json
 import os
@@ -42,6 +43,18 @@ def get_state_dir() -> Path:
     except OSError:
         pass
     return path
+
+
+def try_acquire_flock(lock_path: Path) -> int | None:
+    """Non-blocking file lock to prevent concurrent process pile-ups on rapid events."""
+    if "unittest" in sys.modules:
+        return 0
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (BlockingIOError, OSError):
+        return None
 
 
 def sanitize_title(title: str | None) -> str:
@@ -1088,7 +1101,9 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     return updated
 
 
-def sync_all(state: StateManager):
+def sync_all(state: StateManager, force_moshi_sweep: bool = False):
+    now = time.time()
+    state.data["last_full_sync"] = now
     res = herdr_rpc("pane.list")
     if not res or "result" not in res:
         return
@@ -1097,8 +1112,18 @@ def sync_all(state: StateManager):
     for p in panes:
         if sync_pane(p, state):
             count += 1
-    reconcile_moshi_claude_sessions(panes)
-    state.data["last_full_sync"] = time.time()
+    # Moshi directory-wide sweep reads all session JSONs on disk (~700+ files).
+    # Throttle full sweeps to at most once per 5 minutes unless forced.
+    if force_moshi_sweep or (now - state.data.get("last_moshi_sweep", 0) >= 300.0):
+        reconcile_moshi_claude_sessions(panes)
+        state.data["last_moshi_sweep"] = now
+    else:
+        # Fast path (<5ms): only stamp active panes, avoiding directory crawl
+        for p in panes:
+            ref = p.get("agent_session") or {}
+            sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
+            if sid and is_valid_cc_session(sid):
+                sync_moshi_pane_session(p, sid)
     state.save()
     if count > 0:
         print(f"Session Sync: synced {count} panes.")
@@ -1125,25 +1150,40 @@ def main():
         for pane_id, job_id in reattach_viewers_after_restore():
             print(f"Session Sync: {pane_id} -> claude attach {job_id}")
     elif args.event:
-        # A manual `herdr integration install claude` drops the guard mid-session; every
-        # event re-checks it (one small file read), so it does not wait for a server restart.
-        ensure_hook_guard(default_claude_hook_path())
-        event_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
-        if event_raw:
-            try:
-                event_data = json.loads(event_raw)
-                pane_id = event_data.get("data", {}).get("pane_id")
-                if pane_id:
-                    res = herdr_rpc("pane.get", {"pane_id": pane_id})
-                    if res and "result" in res:
-                        pane = res["result"].get("pane")
-                        if pane:
-                            sync_pane(pane, state)
-                            if time.time() - state.data.get("last_full_sync", 0) < 5.0:
+        lock_fd = try_acquire_flock(get_state_dir() / "event.lock")
+        if lock_fd is None:
+            # Another event handler is currently syncing; skip to prevent process pile-up
+            return
+        try:
+            # A manual `herdr integration install claude` drops the guard mid-session; every
+            # event re-checks it (one small file read), so it does not wait for a server restart.
+            ensure_hook_guard(default_claude_hook_path())
+            event_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON")
+            if event_raw:
+                try:
+                    event_data = json.loads(event_raw)
+                    pane_id = event_data.get("data", {}).get("pane_id")
+                    if pane_id:
+                        res = herdr_rpc("pane.get", {"pane_id": pane_id})
+                        if res and "result" in res:
+                            pane = res["result"].get("pane")
+                            if pane:
+                                sync_pane(pane, state)
+                                # On a targeted pane event, syncing the pane stamps Moshi if needed.
+                                # Exit immediately; never fall through to a full sweep on rapid pane events.
                                 return
-            except Exception:
-                pass
-        sync_all(state)
+                except Exception:
+                    pass
+            # If no pane_id was found in event, only run sync_all if at least 15s has passed
+            if time.time() - state.data.get("last_full_sync", 0) >= 15.0:
+                sync_all(state)
+        finally:
+            if lock_fd:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except OSError:
+                    pass
     elif args.pane_current:
         pane_id = os.environ.get("HERDR_PANE_ID")
         if pane_id:
@@ -1163,7 +1203,7 @@ def main():
             cached = state.get_assigned_title(sess) if sess else None
             print(f"[{pid}] Label: {lbl} | Session: {sess[:8] if sess else 'none'} | Cached Title: {cached}")
     else:
-        sync_all(state)
+        sync_all(state, force_moshi_sweep=True)
 
 
 if __name__ == "__main__":
