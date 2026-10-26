@@ -77,3 +77,22 @@ it: `[ -z "${CLAUDE_JOB_DIR:-}" ] || exit 0` after the shipped `HERDR_PANE_ID` c
 `CLAUDE_JOB_DIR`, and leaves the file alone if the anchor line moved. Do not fork the hook
 again; `~/Desktop/now/herdr-upstream/run_20261014/repro.sh --overlay` checks the whole setup
 in isolation (prints FIXED).
+
+## Moshi pane bindings (workaround, remove when Moshi fixes it)
+Moshi (moshi-hook 0.4.37) maps a Herdr pane to a session through
+`~/Library/Application Support/Moshi/claude-sessions/<sid>.json`: a matching `herdrPane` + `herdrTabId`
+scores 200, a matching `herdrTabId` alone scores 120. A viewer pane (`claude attach`) never
+gets `herdrPane` from moshi-hook (its shell-PID lookup misses the daemon-run conversation),
+so another active session in the tab wins it in Chat View, or the pane shows no session when
+that winner is parked. `reconcile_moshi_claude_sessions` stamps every pane's session and
+clears `herdr*` fields from sessions no pane holds.
+
+- Writes keep the file's mode (Moshi uses 0600) and every other field; moshi-hook reads before it
+  writes, so it keeps our fields.
+- A session any pane holds is never cleared, even without a transcript yet (moshi-hook
+  binds it at SessionStart). The transcript check only gates creating a file for it.
+- Moshi has no public tracker; reported via in-app Support
+  (draft: `~/Desktop/now/herdr-upstream/run_20261026/moshi-report.md`).
+- Remove when a viewer pane resolves to its own session in Moshi with this code disabled.
+  Check: for each pane in `pane.list`, run `HERDR_ENV=1 HERDR_PANE_ID=<id> HERDR_TAB_ID=<tab> moshi-hook context`
+  and confirm the output names the pane's `agent_session`.
