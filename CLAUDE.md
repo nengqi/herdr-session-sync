@@ -96,3 +96,13 @@ clears `herdr*` fields from sessions no pane holds.
 - Remove when a viewer pane resolves to its own session in Moshi with this code disabled.
   Check: for each pane in `pane.list`, run `HERDR_ENV=1 HERDR_PANE_ID=<id> HERDR_TAB_ID=<tab> moshi-hook context`
   and confirm the output names the pane's `agent_session`.
+
+## 事故背景：标题狂跳与幽灵 session（2026-10-30 自 memory 迁入）
+压缩自 memory `incidents.md` 的 9-02 与 9-17 两条。
+
+- 9-02（v0.1.4）：后台子进程继承父窗格的 `HERDR_PANE_ID`，各自上报 `agent_session_id` 互相抢占，pane 标题狂跳。修法：以 PTY `terminal_title` 为准、不再用 `pane.report_metadata` 反写、hook 加前台 TTY 守卫。副作用到 9-17 才暴露：「占前台 TTY」不等于「在写 transcript」，守卫认下了不写盘的查看器进程。
+- 9-17：重启后 9 个 pane 报 `No conversation found`。两层原因：transcript 懒写入（`SessionStart` 只分配 UUID，`.jsonl` 到第一条用户消息才落盘，全机 898 个 `session-env/` 里 569 个没有）；同一 pane 的前台查看器进程从不写盘，真身是另一 TTY 上的 `kind:bg` 进程。
+- 修复 v0.1.12（hook 与 `sync.py` 对称）：`is_valid_cc_session()` 校验；查看器改报 `jobs/<id>/state.json` 的 `resumeSessionId`（日志 `REDIRECTED_TO_BG`）；拿不准不写（`SKIPPED_UNWRITTEN`）。
+- 已排除的联结键：`parkedJobId` 会失效（job 目录常被删，是死指针）；viewer argv 无 `attach <id>`；两进程不同 TTY 无 socket 直连；`--spawned-by` 与每个活 bg session 共享同一 socket，无区分力。
+- 首版修复引入误绑，被 codex 当天抓出：把「无 transcript」直接当「是查看器」，新开未输入的会话也走名字兜底（16 个 interactive 里 12 个没有 `parkedJobId`）。补了 `parkedJobId` 门禁；`_pid_alive` 换成 `_is_live_claude_process`。`procStart` 是 UTC，`ps lstart` 是本地时间，要解析成时刻再比。
+- 名字兜底：用户拍板先保留现状，有自我确认回环（`sync_pane` 自己写 label）。发现某 pane resume 到错误会话，就删掉这条分支。
