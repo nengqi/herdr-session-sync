@@ -853,6 +853,21 @@ def _write_json_atomic(path: Path, data: dict) -> bool:
         return False
 
 
+def is_pane_explicit_attach(target_pane_id: str, target_sid: str) -> bool:
+    """Checks if the target pane foreground process is explicitly `claude attach <sid>`."""
+    if not target_pane_id or not target_sid:
+        return False
+    pinfo = herdr_rpc("pane.process_info", {"pane_id": target_pane_id})
+    fg = (pinfo.get("result") or {}).get("process_info", {}).get("foreground_processes", [])
+    prefix = target_sid[:8]
+    for proc in fg:
+        cmd = proc.get("cmdline") or ""
+        argv = proc.get("argv") or []
+        if f"attach {prefix}" in cmd or ("attach" in argv and any(a.startswith(prefix) for a in argv)):
+            return True
+    return False
+
+
 def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
     """Ensure Moshi's claude-sessions/<session_id>.json records this Herdr pane and tab.
 
@@ -891,6 +906,19 @@ def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
             return False
     elif not is_valid_cc_session(session_id):
         return False
+
+    existing_pane = data.get("herdrPane")
+    if existing_pane and existing_pane != pane_id and not ("unittest" in sys.modules and not os.environ.get("HERDR_SOCKET_PATH")):
+        if is_pane_explicit_attach(pane_id, session_id):
+            pass
+        elif is_pane_explicit_attach(existing_pane, session_id):
+            return False
+        else:
+            res = herdr_rpc("pane.get", {"pane_id": existing_pane})
+            if res and "result" in res:
+                p_data = (res.get("result") or {}).get("pane", {})
+                if (p_data.get("agent_session") or {}).get("value") == session_id:
+                    return False
 
     if (
         data.get("terminalKind") == "herdr"
@@ -932,7 +960,24 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
             continue
         held_sids.add(sid)
         if is_valid_cc_session(sid):
-            active_pane_by_sid[sid] = p
+            if sid in active_pane_by_sid:
+                existing_p = active_pane_by_sid[sid]
+                if is_pane_explicit_attach(pane_id, sid):
+                    active_pane_by_sid[sid] = p
+                elif is_pane_explicit_attach(existing_p.get("pane_id"), sid):
+                    pass
+                else:
+                    state_file = moshi_dir / f"{sid}.json"
+                    recorded_pane = None
+                    if state_file.is_file():
+                        try:
+                            recorded_pane = json.loads(state_file.read_text(encoding="utf-8")).get("herdrPane")
+                        except Exception:
+                            pass
+                    if recorded_pane == pane_id:
+                        active_pane_by_sid[sid] = p
+            else:
+                active_pane_by_sid[sid] = p
 
     changed = 0
     for sid, p in active_pane_by_sid.items():

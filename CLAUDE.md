@@ -106,3 +106,4 @@ clears `herdr*` fields from sessions no pane holds.
 - 已排除的联结键：`parkedJobId` 会失效（job 目录常被删，是死指针）；viewer argv 无 `attach <id>`；两进程不同 TTY 无 socket 直连；`--spawned-by` 与每个活 bg session 共享同一 socket，无区分力。
 - 首版修复引入误绑，被 codex 当天抓出：把「无 transcript」直接当「是查看器」，新开未输入的会话也走名字兜底（16 个 interactive 里 12 个没有 `parkedJobId`）。补了 `parkedJobId` 门禁；`_pid_alive` 换成 `_is_live_claude_process`。`procStart` 是 UTC，`ps lstart` 是本地时间，要解析成时刻再比。
 - 名字兜底：用户拍板先保留现状，有自我确认回环（`sync_pane` 自己写 label）。发现某 pane resume 到错误会话，就删掉这条分支。
+- 教训：先查谁在写盘再编机制，联结键先证明有区分力（memory `debug-evidence-discipline.md` #12）；改完必跑 rv，两个真 bug 都是 codex 抓的。

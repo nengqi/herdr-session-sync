@@ -1137,6 +1137,34 @@ class TestSyncTitle(unittest.TestCase):
                 mode = stat.S_IMODE((moshi_dir / f"{sid}.json").stat().st_mode)
                 self.assertEqual(mode, 0o600, sid)
 
+    def test_reconcile_collision_keeps_recorded_pane(self):
+        """When two panes report the same session ID, the recorded owner in Moshi is preserved."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            original = {"terminalKind": "herdr", "herdrPane": "w1:pQS", "herdrTabId": "w1:t7B", "herdrWorkspaceId": "w1"}
+            (moshi_dir / f"{sid}.json").write_text(json.dumps(original))
+            # panes list has w1:pQS first, w1:p14S second with same sid
+            panes = [
+                {"pane_id": "w1:pQS", "tab_id": "w1:t7B", "workspace_id": "w1",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+                {"pane_id": "w1:p14S", "tab_id": "w1:t1JY", "workspace_id": "w1",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+            ]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True):
+                # Should not overwrite w1:pQS with w1:p14S
+                changed = reconcile_moshi_claude_sessions(panes)
+                self.assertEqual(changed, 0)
+
+            data = json.loads((moshi_dir / f"{sid}.json").read_text())
+            self.assertEqual(data["herdrPane"], "w1:pQS")
+            self.assertEqual(data["herdrTabId"], "w1:t7B")
+
     def test_try_acquire_flock_concurrency(self):
         """A lock held non-blockingly rejects second acquisition."""
         import os
