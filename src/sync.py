@@ -858,9 +858,14 @@ def is_pane_explicit_attach(target_pane_id: str, target_sid: str) -> bool:
     if not target_pane_id or not target_sid:
         return False
     pinfo = herdr_rpc("pane.process_info", {"pane_id": target_pane_id}) or {}
-    fg = (pinfo.get("result") or {}).get("process_info", {}).get("foreground_processes", [])
+    info = (pinfo.get("result") or {}).get("process_info")
+    fg = info.get("foreground_processes") if isinstance(info, dict) else None
+    if not isinstance(fg, list):
+        return False
     prefix = target_sid[:8]
     for proc in fg:
+        if not isinstance(proc, dict):
+            continue
         cmd = proc.get("cmdline") or ""
         argv = proc.get("argv") or []
         if f"attach {prefix}" in cmd or ("attach" in argv and any(a.startswith(prefix) for a in argv)):
@@ -912,11 +917,12 @@ def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
     # overwriting it on every event. If Herdr cannot be asked, don't write.
     existing_pane = data.get("herdrPane")
     if existing_pane and existing_pane != pane_id:
-        res = herdr_rpc("pane.get", {"pane_id": existing_pane})
-        if not res:
+        res = herdr_rpc("pane.get", {"pane_id": existing_pane}) or {}
+        gone = (res.get("error") or {}).get("code") == "pane_not_found"
+        other = ((res.get("result") or {}).get("pane") or {}) if isinstance(res.get("result"), dict) else {}
+        if not gone and not other:
             return False
-        held = ((res.get("result") or {}).get("pane") or {}).get("agent_session") or {}
-        if held.get("value") == session_id:
+        if not gone and (other.get("agent_session") or {}).get("value") == session_id:
             return False
 
     if (
@@ -938,32 +944,22 @@ def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
     return _write_json_atomic(state_file, data)
 
 
-def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
-    """Stamp active Herdr pane bindings into Moshi state and strip stale herdr* fields."""
-    if "unittest" in sys.modules and not os.environ.get("MOSHI_CLAUDE_SESSIONS_DIR"):
-        return 0
-    moshi_dir = moshi_claude_sessions_dir()
-    if not moshi_dir.is_dir():
-        return 0
+def moshi_owner_panes(panes: list[dict]) -> dict[str, dict]:
+    """Pick the one pane per held session that Moshi should record.
 
-    # Every session a pane holds keeps its binding; only those with a transcript get stamped.
-    # A just-started session has none until its first prompt, but moshi-hook already recorded
-    # its pane -- stripping that would hand the pane to a same-tab session.
-    held_sids: set[str] = set()
+    Several panes can hold one session; Moshi records only one. Keep the recorded pane
+    while it still holds the session, else prefer an explicit `claude attach <sid>`,
+    else the first in list order. Sessions without a transcript are left out.
+    """
+    moshi_dir = moshi_claude_sessions_dir()
     holders_by_sid: dict[str, list[dict]] = {}
     for p in panes:
         pane_id = (p.get("pane_id") or "").strip()
         ref = p.get("agent_session") or {}
         sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
-        if not (pane_id and sid):
-            continue
-        held_sids.add(sid)
-        if is_valid_cc_session(sid):
+        if pane_id and sid and is_valid_cc_session(sid):
             holders_by_sid.setdefault(sid, []).append(p)
-
-    # Several panes can hold one session; Moshi records only one. Keep the recorded pane
-    # while it still holds the session, else prefer an explicit `claude attach <sid>`.
-    active_pane_by_sid: dict[str, dict] = {}
+    owners: dict[str, dict] = {}
     for sid, holders in holders_by_sid.items():
         chosen = holders[0]
         if len(holders) > 1:
@@ -976,7 +972,28 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
             preferred = recorded or [p for p in holders if is_pane_explicit_attach(p.get("pane_id"), sid)]
             if preferred:
                 chosen = preferred[0]
-        active_pane_by_sid[sid] = chosen
+        owners[sid] = chosen
+    return owners
+
+
+def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
+    """Stamp active Herdr pane bindings into Moshi state and strip stale herdr* fields."""
+    if "unittest" in sys.modules and not os.environ.get("MOSHI_CLAUDE_SESSIONS_DIR"):
+        return 0
+    moshi_dir = moshi_claude_sessions_dir()
+    if not moshi_dir.is_dir():
+        return 0
+
+    # Every session a pane holds keeps its binding; only those with a transcript get stamped.
+    # A just-started session has none until its first prompt, but moshi-hook already recorded
+    # its pane -- stripping that would hand the pane to a same-tab session.
+    held_sids: set[str] = set()
+    for p in panes:
+        ref = p.get("agent_session") or {}
+        sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
+        if (p.get("pane_id") or "").strip() and sid:
+            held_sids.add(sid)
+    active_pane_by_sid = moshi_owner_panes(panes)
 
     changed = 0
     for sid, p in active_pane_by_sid.items():
@@ -1037,7 +1054,7 @@ def ensure_hook_guard(hook_path: Path) -> str:
     return "patched"
 
 
-def sync_pane(pane: dict, state: StateManager) -> bool:
+def sync_pane(pane: dict, state: StateManager, stamp_moshi: bool = True) -> bool:
     pane_id = pane.get("pane_id")
     if not pane_id:
         return False
@@ -1094,7 +1111,7 @@ def sync_pane(pane: dict, state: StateManager) -> bool:
     elif fg_title and not target_title:
         target_title = fg_title
 
-    if session_id:
+    if session_id and stamp_moshi:
         sync_moshi_pane_session(pane, session_id)
 
     # Priority 3: When Claude is not running in foreground, prioritize physical PTY terminal title
@@ -1153,8 +1170,10 @@ def sync_all(state: StateManager, force_moshi_sweep: bool = False):
         return
     panes = res.get("result", {}).get("panes", [])
     count = 0
+    # Moshi is stamped once below from moshi_owner_panes, so panes sharing a session
+    # don't race to be recorded first.
     for p in panes:
-        if sync_pane(p, state):
+        if sync_pane(p, state, stamp_moshi=False):
             count += 1
     # Moshi directory-wide sweep reads all session JSONs on disk (~700+ files).
     # Throttle full sweeps to at most once per 5 minutes unless forced.
@@ -1163,11 +1182,8 @@ def sync_all(state: StateManager, force_moshi_sweep: bool = False):
         state.data["last_moshi_sweep"] = now
     else:
         # Fast path (<5ms): only stamp active panes, avoiding directory crawl
-        for p in panes:
-            ref = p.get("agent_session") or {}
-            sid = (ref.get("value") or "").strip() if isinstance(ref.get("value"), str) else ""
-            if sid and is_valid_cc_session(sid):
-                sync_moshi_pane_session(p, sid)
+        for sid, p in moshi_owner_panes(panes).items():
+            sync_moshi_pane_session(p, sid)
     state.save()
     if count > 0:
         print(f"Session Sync: synced {count} panes.")
