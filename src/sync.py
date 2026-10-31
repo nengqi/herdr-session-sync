@@ -857,7 +857,7 @@ def is_pane_explicit_attach(target_pane_id: str, target_sid: str) -> bool:
     """Checks if the target pane foreground process is explicitly `claude attach <sid>`."""
     if not target_pane_id or not target_sid:
         return False
-    pinfo = herdr_rpc("pane.process_info", {"pane_id": target_pane_id})
+    pinfo = herdr_rpc("pane.process_info", {"pane_id": target_pane_id}) or {}
     fg = (pinfo.get("result") or {}).get("process_info", {}).get("foreground_processes", [])
     prefix = target_sid[:8]
     for proc in fg:
@@ -907,18 +907,17 @@ def sync_moshi_pane_session(pane: dict, session_id: str | None) -> bool:
     elif not is_valid_cc_session(session_id):
         return False
 
+    # Moshi keeps one herdrPane per session. While the recorded pane still holds this
+    # session, leave it: two panes showing the same session would otherwise take turns
+    # overwriting it on every event. If Herdr cannot be asked, don't write.
     existing_pane = data.get("herdrPane")
-    if existing_pane and existing_pane != pane_id and not ("unittest" in sys.modules and not os.environ.get("HERDR_SOCKET_PATH")):
-        if is_pane_explicit_attach(pane_id, session_id):
-            pass
-        elif is_pane_explicit_attach(existing_pane, session_id):
+    if existing_pane and existing_pane != pane_id:
+        res = herdr_rpc("pane.get", {"pane_id": existing_pane})
+        if not res:
             return False
-        else:
-            res = herdr_rpc("pane.get", {"pane_id": existing_pane})
-            if res and "result" in res:
-                p_data = (res.get("result") or {}).get("pane", {})
-                if (p_data.get("agent_session") or {}).get("value") == session_id:
-                    return False
+        held = ((res.get("result") or {}).get("pane") or {}).get("agent_session") or {}
+        if held.get("value") == session_id:
+            return False
 
     if (
         data.get("terminalKind") == "herdr"
@@ -951,7 +950,7 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
     # A just-started session has none until its first prompt, but moshi-hook already recorded
     # its pane -- stripping that would hand the pane to a same-tab session.
     held_sids: set[str] = set()
-    active_pane_by_sid: dict[str, dict] = {}
+    holders_by_sid: dict[str, list[dict]] = {}
     for p in panes:
         pane_id = (p.get("pane_id") or "").strip()
         ref = p.get("agent_session") or {}
@@ -960,24 +959,24 @@ def reconcile_moshi_claude_sessions(panes: list[dict]) -> int:
             continue
         held_sids.add(sid)
         if is_valid_cc_session(sid):
-            if sid in active_pane_by_sid:
-                existing_p = active_pane_by_sid[sid]
-                if is_pane_explicit_attach(pane_id, sid):
-                    active_pane_by_sid[sid] = p
-                elif is_pane_explicit_attach(existing_p.get("pane_id"), sid):
-                    pass
-                else:
-                    state_file = moshi_dir / f"{sid}.json"
-                    recorded_pane = None
-                    if state_file.is_file():
-                        try:
-                            recorded_pane = json.loads(state_file.read_text(encoding="utf-8")).get("herdrPane")
-                        except Exception:
-                            pass
-                    if recorded_pane == pane_id:
-                        active_pane_by_sid[sid] = p
-            else:
-                active_pane_by_sid[sid] = p
+            holders_by_sid.setdefault(sid, []).append(p)
+
+    # Several panes can hold one session; Moshi records only one. Keep the recorded pane
+    # while it still holds the session, else prefer an explicit `claude attach <sid>`.
+    active_pane_by_sid: dict[str, dict] = {}
+    for sid, holders in holders_by_sid.items():
+        chosen = holders[0]
+        if len(holders) > 1:
+            recorded_pane = None
+            try:
+                recorded_pane = json.loads((moshi_dir / f"{sid}.json").read_text(encoding="utf-8")).get("herdrPane")
+            except Exception:
+                pass
+            recorded = [p for p in holders if p.get("pane_id") == recorded_pane]
+            preferred = recorded or [p for p in holders if is_pane_explicit_attach(p.get("pane_id"), sid)]
+            if preferred:
+                chosen = preferred[0]
+        active_pane_by_sid[sid] = chosen
 
     changed = 0
     for sid, p in active_pane_by_sid.items():
