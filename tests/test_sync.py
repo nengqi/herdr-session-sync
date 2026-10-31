@@ -1137,6 +1137,175 @@ class TestSyncTitle(unittest.TestCase):
                 mode = stat.S_IMODE((moshi_dir / f"{sid}.json").stat().st_mode)
                 self.assertEqual(mode, 0o600, sid)
 
+    def test_reconcile_collision_keeps_recorded_pane(self):
+        """When two panes report the same session ID, the recorded owner in Moshi is preserved."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            original = {"terminalKind": "herdr", "herdrPane": "w1:pQS", "herdrTabId": "w1:t7B", "herdrWorkspaceId": "w1"}
+            (moshi_dir / f"{sid}.json").write_text(json.dumps(original))
+            # panes list has w1:pQS first, w1:p14S second with same sid
+            panes = [
+                {"pane_id": "w1:pQS", "tab_id": "w1:t7B", "workspace_id": "w1",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+                {"pane_id": "w1:p14S", "tab_id": "w1:t1JY", "workspace_id": "w1",
+                 "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+            ]
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True):
+                # Should not overwrite w1:pQS with w1:p14S
+                changed = reconcile_moshi_claude_sessions(panes)
+                self.assertEqual(changed, 0)
+
+            data = json.loads((moshi_dir / f"{sid}.json").read_text())
+            self.assertEqual(data["herdrPane"], "w1:pQS")
+            self.assertEqual(data["herdrTabId"], "w1:t7B")
+
+    def _moshi_pane_write(self, rpc_result, recorded="w1:pQS"):
+        """Run sync_moshi_pane_session for w1:p14S against a file recorded on `recorded`."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import sync_moshi_pane_session
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            (moshi_dir / f"{sid}.json").write_text(json.dumps(
+                {"terminalKind": "herdr", "herdrPane": recorded, "herdrTabId": "w1:t7B", "herdrWorkspaceId": "w1"}))
+            pane = {"pane_id": "w1:p14S", "tab_id": "w1:t1JY", "workspace_id": "w1"}
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.herdr_rpc", return_value=rpc_result) as rpc:
+                wrote = sync_moshi_pane_session(pane, sid)
+            return wrote, json.loads((moshi_dir / f"{sid}.json").read_text())["herdrPane"], rpc
+
+    def test_moshi_sync_leaves_pane_that_still_holds_session(self):
+        """The recorded pane still shows the session: another pane must not take it over."""
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        wrote, owner, rpc = self._moshi_pane_write(
+            {"result": {"pane": {"pane_id": "w1:pQS", "agent_session": {"value": sid}}}})
+        self.assertFalse(wrote)
+        self.assertEqual(owner, "w1:pQS")
+        rpc.assert_called_once_with("pane.get", {"pane_id": "w1:pQS"})
+
+    def test_moshi_sync_does_not_write_when_herdr_unreachable(self):
+        """No answer from Herdr means we cannot tell who holds the session, so write nothing."""
+        wrote, owner, _ = self._moshi_pane_write(None)
+        self.assertFalse(wrote)
+        self.assertEqual(owner, "w1:pQS")
+
+    def test_moshi_sync_takes_over_from_pane_that_moved_on(self):
+        """The recorded pane now holds another session (or is gone): this pane takes the record."""
+        wrote, owner, _ = self._moshi_pane_write(
+            {"result": {"pane": {"pane_id": "w1:pQS", "agent_session": {"value": "6db10eb2-9126-4d4f-b1ae-4be8280c31c7"}}}})
+        self.assertTrue(wrote)
+        self.assertEqual(owner, "w1:p14S")
+        wrote, owner, _ = self._moshi_pane_write({"error": {"code": "pane_not_found"}})
+        self.assertTrue(wrote)
+        self.assertEqual(owner, "w1:p14S")
+
+    def test_reconcile_two_attach_viewers_do_not_flip(self):
+        """Two panes both `claude attach` the same session: the recorded one keeps it, whatever
+        order Herdr lists them in, and repeated runs write nothing."""
+        import tempfile
+        from unittest.mock import patch
+        from sync import reconcile_moshi_claude_sessions
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        panes = [
+            {"pane_id": "w1:pQS", "tab_id": "w1:t7B", "workspace_id": "w1",
+             "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+            {"pane_id": "w1:p14S", "tab_id": "w1:t1JY", "workspace_id": "w1",
+             "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+        ]
+
+        def fake_rpc(method, params=None, timeout=1.5):
+            pid = (params or {}).get("pane_id")
+            if method == "pane.process_info":
+                return {"result": {"process_info": {"foreground_processes": [
+                    {"cmdline": f"claude attach {sid[:8]}", "argv": ["claude", "attach", sid[:8]]}]}}}
+            if method == "pane.get":
+                return {"result": {"pane": {"pane_id": pid, "agent_session": {"value": sid}}}}
+            return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            (moshi_dir / f"{sid}.json").write_text(json.dumps(
+                {"terminalKind": "herdr", "herdrPane": "w1:p14S", "herdrTabId": "w1:t1JY", "herdrWorkspaceId": "w1"}))
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True), \
+                 patch("sync.herdr_rpc", side_effect=fake_rpc):
+                for order in (panes, panes[::-1], panes):
+                    self.assertEqual(reconcile_moshi_claude_sessions(order), 0)
+            self.assertEqual(json.loads((moshi_dir / f"{sid}.json").read_text())["herdrPane"], "w1:p14S")
+
+    def test_moshi_sync_does_not_write_on_other_herdr_errors(self):
+        """Only `pane_not_found` or an answer naming another session allows a takeover."""
+        wrote, owner, _ = self._moshi_pane_write({"error": {"code": "internal"}})
+        self.assertFalse(wrote)
+        self.assertEqual(owner, "w1:pQS")
+        wrote, owner, _ = self._moshi_pane_write({"result": {}})
+        self.assertFalse(wrote)
+        self.assertEqual(owner, "w1:pQS")
+
+    def test_explicit_attach_tolerates_missing_process_info(self):
+        from unittest.mock import patch
+        from sync import is_pane_explicit_attach
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        for res in (None, {"result": {"process_info": None}},
+                    {"result": {"process_info": {"foreground_processes": None}}}):
+            with patch("sync.herdr_rpc", return_value=res):
+                self.assertFalse(is_pane_explicit_attach("w1:p14S", sid))
+
+    def test_sync_all_records_attach_viewer_over_earlier_plain_pane(self):
+        """With no Moshi record yet, sync_all must not let the first-listed plain pane win
+        before owner selection runs: the explicit attach viewer gets the record."""
+        import tempfile
+        from unittest.mock import patch, MagicMock
+        import sync
+
+        sid = "0d586282-2a27-477e-9bc1-44d531bdbbd6"
+        panes = [
+            {"pane_id": "w1:pA", "tab_id": "w1:t1", "workspace_id": "w1",
+             "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+            {"pane_id": "w1:pB", "tab_id": "w1:t2", "workspace_id": "w1",
+             "agent_session": {"agent": "claude", "kind": "id", "value": sid}},
+        ]
+
+        def fake_rpc(method, params=None, timeout=1.5):
+            pid = (params or {}).get("pane_id")
+            if method == "pane.list":
+                return {"result": {"panes": panes}}
+            if method == "pane.process_info":
+                cmd = f"claude attach {sid[:8]}" if pid == "w1:pB" else "claude"
+                return {"result": {"process_info": {"foreground_processes": [{"cmdline": cmd, "argv": cmd.split()}]}}}
+            if method == "pane.get":
+                return {"result": {"pane": {"pane_id": pid, "agent_session": {"value": sid}}}}
+            return None
+
+        def fake_sync_pane(pane, state, stamp_moshi=True):
+            if stamp_moshi:
+                sync.sync_moshi_pane_session(pane, sid)
+            return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            moshi_dir = Path(tmpdir)
+            (moshi_dir / f"{sid}.json").write_text(json.dumps({"model": "Opus"}))
+            state = MagicMock()
+            state.data = {}
+            with patch.dict("os.environ", {"MOSHI_CLAUDE_SESSIONS_DIR": str(moshi_dir)}), \
+                 patch("sync.is_valid_cc_session", return_value=True), \
+                 patch("sync.herdr_rpc", side_effect=fake_rpc), \
+                 patch("sync.sync_pane", side_effect=fake_sync_pane):
+                for force in (True, False):
+                    state.data = {}
+                    sync.sync_all(state, force_moshi_sweep=force)
+                    self.assertEqual(json.loads((moshi_dir / f"{sid}.json").read_text())["herdrPane"], "w1:pB")
+
     def test_try_acquire_flock_concurrency(self):
         """A lock held non-blockingly rejects second acquisition."""
         import os
